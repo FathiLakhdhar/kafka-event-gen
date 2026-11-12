@@ -678,6 +678,97 @@ function makeMessage(i) {
   return { topic, shown, msg: { key, value: bytes, headers } };
 }
 
+// ---- Kafka connection: brokers, TLS and SASL ----
+// "${ENV:NAME}" in any of their strings reads an environment variable, so secrets stay out of the plan.
+// Values read for ssl and sasl, and every secret field, are replaced by *** in anything we print.
+const ENV_REF = /\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}/g;
+const SECRET_KEYS = new Set(["password", "key", "passphrase", "secretAccessKey", "sessionToken", "token"]);
+const SASL_NEEDS = {
+  plain: ["username", "password"],
+  "scram-sha-256": ["username", "password"],
+  "scram-sha-512": ["username", "password"],
+  aws: ["authorizationIdentity", "accessKeyId", "secretAccessKey"],
+  oauthbearer: ["token"],
+};
+const secrets = new Set();
+// longest first, so a short value can't break up a longer one before it's replaced
+const redact = (text) => [...secrets].sort((a, b) => b.length - a.length).reduce((t, v) => t.split(v).join("***"), String(text));
+
+// resolves ${ENV:...} in every string of a value. In ssl and sasl (`hide`), secret fields and values
+// read from the environment are kept for redaction.
+function withEnv(v, where, hide, secret = false) {
+  if (typeof v === "string") {
+    const out = v.replace(ENV_REF, (_, name) => {
+      const val = process.env[name];
+      if (val == null || val === "") throw Error(`${where}: environment variable ${name} is ${val == null ? "not set" : "empty"}`);
+      return val;
+    });
+    if (/\$\{\s*env\s*:/i.test(v.replace(ENV_REF, "")))
+      throw Error(`${where}: write environment variables as \${ENV:NAME}, with NAME in letters, digits and _`);
+    if (hide && out && (secret || out !== v)) secrets.add(out);
+    return out;
+  }
+  if (Array.isArray(v)) return v.map((x, i) => withEnv(x, `${where}[${i}]`, hide, secret));
+  if (v && typeof v === "object")
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, withEnv(x, `${where}.${k}`, hide, secret || SECRET_KEYS.has(k))]));
+  return v;
+}
+
+// checked at startup, also in a dry run (which doesn't read the environment, since it doesn't connect)
+function checkConnection() {
+  const { ssl, sasl } = plan;
+  if (ssl != null && typeof ssl !== "boolean" && (typeof ssl !== "object" || Array.isArray(ssl)))
+    throw Error(`"ssl" must be true, false or an object of TLS options like { "ca": ..., "rejectUnauthorized": true }`);
+  if (sasl != null) {
+    if (typeof sasl !== "object" || Array.isArray(sasl)) throw Error(`"sasl" must be an object like { "mechanism": "scram-sha-512", ... }`);
+    const mech = String(sasl.mechanism ?? "").toLowerCase();
+    if (!SASL_NEEDS[mech])
+      throw Error(`sasl.mechanism must be one of ${Object.keys(SASL_NEEDS).join(", ")}, got ${JSON.stringify(sasl.mechanism)}`);
+    for (const k of SASL_NEEDS[mech])
+      if (typeof sasl[k] !== "string" || !sasl[k]) throw Error(`sasl: "${mech}" needs "${k}" (e.g. "\${ENV:KAFKA_${k.replace(/[A-Z]/g, (c) => "_" + c).toUpperCase()}}")`);
+  }
+  // a secret written straight into the plan works, but it ends up in version control
+  const literal = (o, where) => Object.entries(o || {}).forEach(([k, v]) => {
+    if (SECRET_KEYS.has(k) && typeof v === "string" && !v.includes("${"))
+      console.error(`warning: ${where}.${k} is written in the plan; read it from the environment with "\${ENV:NAME}"`);
+  });
+  literal(sasl, "sasl");
+  if (typeof ssl === "object") literal(ssl, "ssl");
+}
+checkConnection();
+
+function kafkaConfig() {
+  const brokers = withEnv(plan.brokers, "brokers", false);
+  if (!Array.isArray(brokers) || !brokers.length) throw Error(`"brokers" must be a list like ["localhost:9092"]`);
+  const config = {
+    clientId: withEnv(plan.clientId || "kafka-proto-gen", "clientId", false),
+    brokers: brokers.flatMap((b) => String(b).split(",")).map((b) => b.trim()).filter(Boolean), // one variable can hold "host1:9093,host2:9093"
+    logCreator: () => ({ namespace, label, log }) => {
+      const { message, timestamp, logger, stack, ...extra } = log;
+      const rest = Object.keys(extra).length ? " " + JSON.stringify(extra) : "";
+      console.error(redact(`kafkajs ${label} ${namespace}: ${message}${rest}`));
+    },
+  };
+  if (plan.ssl != null) {
+    config.ssl = typeof plan.ssl === "object" ? withEnv(plan.ssl, "ssl", true) : plan.ssl;
+    for (const k of ["ca", "cert", "key"])
+      for (const pem of [config.ssl[k]].flat().filter((x) => typeof x === "string"))
+        if (!pem.includes("-----BEGIN"))
+          throw Error(`ssl.${k}: expected PEM text (starting with -----BEGIN), not a file path; put the file's contents in an environment variable and use "\${ENV:NAME}"`);
+  }
+  if (plan.sasl != null) {
+    const sasl = withEnv(plan.sasl, "sasl", true);
+    sasl.mechanism = sasl.mechanism.toLowerCase();
+    if (sasl.mechanism === "oauthbearer") {
+      const value = sasl.token;
+      delete sasl.token;
+      sasl.oauthBearerProvider = async () => ({ value }); // kafkajs wants a function; the plan gives a token
+    }
+    config.sasl = sasl;
+  }
+  return config;
+}
+
 // ---- run ----
 let stopping = false;
 process.on("SIGINT", () => {
@@ -690,8 +781,7 @@ process.on("SIGINT", () => {
   let producer;
   try {
     if (!plan.dryRun) {
-      producer = new Kafka({ clientId: plan.clientId || "kafka-proto-gen", brokers: plan.brokers })
-        .producer({ createPartitioner: Partitioners.DefaultPartitioner });
+      producer = new Kafka(kafkaConfig()).producer({ createPartitioner: Partitioners.DefaultPartitioner });
       await producer.connect();
     }
     const rate = plan.ratePerSec || total;
@@ -719,9 +809,9 @@ process.on("SIGINT", () => {
       if (!plan.dryRun && sent < total && !stopping && wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   } catch (err) {
-    console.error(err.message || err);
+    console.error(redact(err.message || err));
     process.exitCode = 1;
   } finally {
-    if (producer) await producer.disconnect();
+    if (producer) await producer.disconnect().catch(() => {});
   }
 })();

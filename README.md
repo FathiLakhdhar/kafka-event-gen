@@ -69,6 +69,8 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 |--------------|-------------|
 | `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]` |
 | `clientId`   | Kafka client id (default `kafka-proto-gen`) |
+| `ssl`        | `true` for TLS with the system's CAs, or TLS options like `{ "ca": ..., "rejectUnauthorized": true }` (see [Secured clusters](#secured-clusters)) |
+| `sasl`       | SASL login, e.g. `{ "mechanism": "scram-sha-512", "username": ..., "password": ... }` (see [Secured clusters](#secured-clusters)) |
 | `count`      | Total number of messages to generate. Required with weights; optional with quotas, where it must equal the sum of event counts |
 | `ratePerSec` | Messages per one-second batch (default: all at once) |
 | `dryRun`     | `true` prints messages instead of sending them (no pause between batches) |
@@ -81,6 +83,47 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 | `events`     | List of event definitions |
 
 Paths in `proto`, `descriptor` and `outDir` are relative to the **plan file**, not the folder you run from.
+
+### Secured clusters
+
+Without `ssl` and `sasl` the tool connects in plaintext. Add either or both for a secured cluster, and read credentials from the environment with `${ENV:NAME}` so the plan file holds no secrets:
+
+```json
+"brokers": ["${ENV:KAFKA_BROKERS}"],
+"ssl": true,
+"sasl": { "mechanism": "scram-sha-512", "username": "${ENV:KAFKA_USER}", "password": "${ENV:KAFKA_PASSWORD}" }
+```
+
+```sh
+export KAFKA_BROKERS=broker-1:9093,broker-2:9093 KAFKA_USER=generator KAFKA_PASSWORD=...
+node plan.js plans/plan.json
+```
+
+`${ENV:NAME}` works in any string of `brokers`, `clientId`, `ssl` and `sasl`. A broker entry can hold a comma-separated list, as above.
+
+| `sasl.mechanism` | Needs |
+|------------------|-------|
+| `plain`, `scram-sha-256`, `scram-sha-512` | `username`, `password` |
+| `aws` | `authorizationIdentity`, `accessKeyId`, `secretAccessKey` (optional `sessionToken`) |
+| `oauthbearer` | `token`: a token that is sent as is. Refreshing it is up to you |
+
+`ssl` options are passed to Node's TLS connection. `ca`, `cert` and `key` take the PEM **text**, not a file path. Put the file's contents in a variable, e.g. `export KAFKA_CA="$(cat ca.pem)"` and `"ca": "${ENV:KAFKA_CA}"`. Use `"sasl"` without `"ssl"` for SASL_PLAINTEXT.
+
+Secrets stay out of the output:
+
+- the password, token, private keys and every value read from the environment for `ssl` or `sasl` show as `***` in errors and in the Kafka client's log lines, which go to stderr
+- a dry run doesn't connect, so it doesn't read these variables and runs without them
+- a secret written straight into the plan still works, but prints a warning at startup
+
+The tool doesn't decrypt or store secrets. It only reads them from the environment of the run, so use whatever already holds them to fill that environment for one command:
+
+| Where the secret lives | How to run |
+|---|---|
+| Encrypted file in git ([SOPS](https://github.com/getsops/sops)) | `sops exec-env secrets/staging.enc.env 'node plan.js …'` |
+| 1Password | `op run --env-file=staging.env -- node plan.js …`, with `op://vault/item/field` references in `staging.env` |
+| HashiCorp Vault | `envconsul -secret=kafka/staging node plan.js …`, or export the values from `vault kv get` |
+| CI (GitHub Actions, GitLab…) | map the CI's secrets to `KAFKA_PASSWORD` and so on in the job's environment |
+| Your machine | `node --env-file=.env plan.js …` (built into Node). `.env` is in `.gitignore` so it can't be committed by accident |
 
 ### Events and defaults
 
@@ -557,6 +600,8 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
 - an `iso` value isn't one of the forms in [Dates and times](#dates-and-times) (`"nwo"`, `"now+7y"`), a range ends before it starts, `precision` is unknown or used on a rule other than `iso`, an epoch `precision` is used on a Timestamp field, or `clock` isn't a date-time with a time zone
+- `ssl` isn't `true`, `false` or an object, `sasl.mechanism` is unknown, or a mechanism is missing a field it needs
+- a `${ENV:NAME}` variable isn't set or is empty (the error names the variable, never its value), or `ssl.ca`, `cert` or `key` is a file path instead of PEM text. These are checked when connecting, so a dry run skips them
 - `optional` isn't `true` or `false`, or is used on something other than a header's rule
 - a `traceparent` rule has an unknown option, or a `sampled` outside 0–1
 - `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
