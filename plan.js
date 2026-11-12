@@ -272,8 +272,11 @@ function byRule(r, obj) {
   if (r.traceparent)
     return `00-${hex(32)}-${hex(16)}-${Math.random() < (r.traceparent.sampled ?? 1) ? "01" : "00"}`;
   if (specOf(r)) {
-    const v = pick(specOf(r), r.take) ?? (r.fallback ? byRule(r.fallback, obj) : undefined);
-    if (v === undefined) throw Error(`"${specOf(r)}" has no records left to read`);
+    const spec = specOf(r);
+    let v = pick(spec, r.take);
+    if (v == null && r.fallback) v = byRule(r.fallback, obj);
+    if (v == null && !(parseSpec(spec).key in picked)) throw Error(`"${spec}" has no records left to read`);
+    if (v == null && !r.optional) throw Error(`"${spec}": the record it read has no value there`);
     return v;
   }
   throw Error(`unknown rule ${JSON.stringify(r)}`);
@@ -304,6 +307,7 @@ function uniqueByRule(scope, r, obj) {
   const used = seen.get(scope) ?? seen.set(scope, new Set()).get(scope);
   for (let i = 0; i < 1000; i++) {
     const v = byRule(r, obj);
+    if (v == null) return v; // an optional header left out; nothing to keep unique
     const k = typeof v === "object" ? JSON.stringify(v) : v;
     if (!used.has(k)) return used.add(k), v;
   }
@@ -325,12 +329,23 @@ function checkSpec(spec, where, take) {
   return c;
 }
 // returns the rule kind; collects the keys the rule reads without a fallback into `reads`
-function checkRule(r, where, reads, inDataset = false) {
+function checkRule(r, where, reads, inDataset = false, inHeader = false) {
   if (!r || typeof r !== "object") throw Error(`${where}: rule must be an object, got ${JSON.stringify(r)}`);
   const kind = RULES.find((k) => k in r);
   if (!kind) throw Error(`${where}: unknown rule ${JSON.stringify(r)} (expected one of ${RULES.join(", ")})`);
+  if (r.optional != null) {
+    if (typeof r.optional !== "boolean") throw Error(`${where}: "optional" must be true or false`);
+    if (!inHeader) throw Error(`${where}: "optional" only works on a header's rule (not on fields, or inside a fallback or locale)`);
+  }
   if (kind === "iso") checkIso(r, where);
   else if (r.precision != null) throw Error(`${where}: "precision" only works with iso rules`);
+  if (kind === "traceparent" && typeof r.traceparent === "object") {
+    const { sampled, ...rest } = r.traceparent;
+    if (Object.keys(rest).length)
+      throw Error(`${where}: traceparent only takes "sampled", not ${Object.keys(rest).map((k) => `"${k}"`).join(", ")}`);
+    if (sampled != null && !(typeof sampled === "number" && sampled >= 0 && sampled <= 1))
+      throw Error(`${where}: traceparent "sampled" must be a chance between 0 and 1, got ${JSON.stringify(sampled)}`);
+  }
   if (kind === "faker" && !fakerFn(r.faker)) throw Error(`${where}: faker has no function "${r.faker}"`);
   if (r.locale != null) {
     if (kind !== "faker" && kind !== "email") throw Error(`${where}: "locale" only works with faker and email rules`);
@@ -458,7 +473,7 @@ events.forEach((e) => {
     }
   }
   for (const [h, r] of Object.entries(e.headers))
-    if (checkRule(r, `${e.type} headers.${h}`, reads) === "field" && e.resend)
+    if (checkRule(r, `${e.type} headers.${h}`, reads, false, true) === "field" && e.resend)
       throw Error(`${e.type} headers.${h}: "field" rules don't work on resend events`);
   if (e.key) checkField(e.key, `${e.type} key`);
   for (const [pn, add] of Object.entries(e.pools))
@@ -635,7 +650,10 @@ function makeMessage(i) {
   }
   for (const [h, r] of Object.entries(e.headers)) {
     const v = byRuleIn(`${e.type} headers.${h}`, r, obj); // applies "unique" like other rules
-    if (v == null) throw Error(`${e.type} headers.${h}: rule produced no value`);
+    if (v == null) {
+      if (r.optional) continue; // left out (on a resend, the copied header stays)
+      throw Error(`${e.type} headers.${h}: rule produced no value; add "optional": true to leave the header out instead`);
+    }
     headers[h] = String(v);
   }
 

@@ -196,7 +196,7 @@ Field paths use the camelCase names protobufjs generates (`order_id` → `orderI
 | `int`         | `{ "int": [1, 5] }` | An integer between min and max, inclusive |
 | `email`       | `{ "email": true }` | A random email address |
 | `faker`       | `{ "faker": "person.fullName" }` | Any [Faker](https://fakerjs.dev/api/) function, with optional `"args": [...]` |
-| `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`) |
+| `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`). Unsampled ones get flag `00`; for messages with no `traceparent` at all, see [Traced and untraced services](#traced-and-untraced-services) |
 | `field`       | `{ "field": "orderId" }` | A value from the record being built. **Headers, payloads and datasets only** |
 | `from`        | `{ "from": "contracts.currency" }` | A value from a dataset or pool (see [Reading](#reading-datasets-and-pools)) |
 | `ref`         | `{ "ref": "customers" }` | A whole record from a dataset or pool, as a link (same as `from` without a property) |
@@ -208,6 +208,34 @@ Any rule can also have:
 `faker` and `email` rules can also have:
 
 - **`"locale"`**: generates the value for a country, with local names, phone formats, cities and email domains. Use a fixed [Faker locale](https://fakerjs.dev/guide/localization.html) such as `"fr"`, `"de"`, `"es"` or `"en_GB"`, or a rule that produces one. For example, `{ "field": "country.locale" }` uses the locale of the record's own country.
+
+Header rules can also have:
+
+- **`"optional": true`**: leaves the header out of the message when the rule gives no value, instead of stopping the run. All other headers are unaffected. Use it for headers that are only sometimes present:
+
+  ```json
+  "headers": {
+    "x-sampled":   { "oneOf": [null, "1"], "optional": true },
+    "x-note":      { "field": "note", "optional": true },
+    "x-trace":     { "from": "order.trace", "optional": true }
+  }
+  ```
+
+  The second header follows a proto3 `optional` field, which is left out about 30% of the time. The third reads a header that an earlier event may have left out and stored with `$header.traceparent`. Without `optional`, a rule that gives no value is an error, so typos in a `field` path still fail loudly. `optional` doesn't make a pool or dataset read optional: an event still waits for a record to read. On a resend event, a left-out header keeps the copied value.
+
+### Traced and untraced services
+
+To mix messages from services that trace with messages from services that don't, define the event twice with weights, and remove the header from one copy with `null`:
+
+```json
+"defaults": { "headers": { "traceparent": { "traceparent": {} } } },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "weight": 30 },
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "weight": 70, "headers": { "traceparent": null } }
+]
+```
+
+About 30% of the messages carry a `traceparent` and the rest have none. With quotas, give each copy its own `count` (e.g. 300 and 700). If the event also adds to a pool, give both copies the same `pools`, store the header with `$header.traceparent`, and read it in linked events with `"optional": true`, so they leave it out too. This is different from `"sampled"`, which always sends the header and only changes its flag.
 
 `fromPool` still works as another name for `from`.
 
@@ -529,6 +557,8 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
 - an `iso` value isn't one of the forms in [Dates and times](#dates-and-times) (`"nwo"`, `"now+7y"`), a range ends before it starts, `precision` is unknown or used on a rule other than `iso`, an epoch `precision` is used on a Timestamp field, or `clock` isn't a date-time with a time zone
+- `optional` isn't `true` or `false`, or is used on something other than a header's rule
+- a `traceparent` rule has an unknown option, or a `sampled` outside 0–1
 - `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
 - a rule path, `key` or pool record path doesn't exist in the message or payload
 - a `field` rule is used on a Protobuf message field
