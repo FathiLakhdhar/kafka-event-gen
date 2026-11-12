@@ -100,6 +100,7 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | `rules`   | Field path → rule, overriding the random value for that field |
 | `headers` | Header name → rule |
 | `pools`   | Pool name → record to add after each message (see [Pools](#pools)) |
+| `resend`  | Sends a stored message again, unchanged, in place of generating one (see [Duplicate messages](#duplicate-messages)) |
 
 ### Descriptor sets
 
@@ -320,6 +321,7 @@ An event adds a record to a pool after each message it produces. Each record val
 - a field path, such as `orderId`
 - `$header.<name>`, the header value
 - `$from.<dataset or pool>`, the record this message read from that collection, stored as a link
+- `$message`, the whole message as sent (topic, key, headers and encoded value), for a [resend](#duplicate-messages)
 
 ```json
 { "type": "shop.OrderCreated",
@@ -430,6 +432,61 @@ Quotas are checked against datasets, pools and sub-pools at startup, so the run 
 Error: "order/toPay": shop.OrderPaid (600) take 600 records, but shop.OrderCreated (700) add 700, and only 560 of them go to "order/toPay"
 ```
 
+### Duplicate messages
+
+To test a consumer that deduplicates, send the same message more than once. A **resend** event sends a message that an earlier event stored, byte for byte. Use the simpler patterns below if only the id needs to match.
+
+**Exact copies: `resend`.** The original stores itself in a pool with `$message`, and a resend event sends it again:
+
+```json
+"pools": { "sent": {} },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "key": "orderId", "count": 3,
+    "headers": { "message-id": { "uuid": true } },
+    "pools": { "sent": { "message": "$message" } } },
+  { "resend": { "from": "sent.message", "take": true }, "count": 3 }
+]
+```
+
+Each copy has the same topic, key, headers and encoded value as its original, in every format and with every field type. Since a resend reads from a pool, the original is always sent first. With `"take": true` each stored message is resent once, and quotas check that there are enough. Without it, a random stored message is picked each time.
+
+A resend event doesn't use `defaults`, because a default topic or a new `traceparent` would change the copy. It can only have these keys:
+
+| Key | Description |
+|-----|-------------|
+| `resend` | `{ "from": "<pool>.<field>", "take": true }`: the record field that holds the message. `take` is optional |
+| `type` | A name for errors and logs. The copy keeps the original's type header |
+| `topic` | Sends the copy to another topic, for example a retry topic. Default: the original's topic |
+| `headers` | Headers to add or replace on the copy, e.g. `{ "x-retry": { "static": "1" } }` |
+| `pools` | Records to add after the copy: `$message`, `$header.<name>` or `$from.<pool>` |
+| `count`, `weight` | As for any event |
+
+To send each message three times, chain resends: the first copy stores itself again with `$message`, and a second resend takes from there:
+
+```json
+"pools": { "sent1": {}, "sent2": {} },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "count": 2,
+    "pools": { "sent1": { "message": "$message" } } },
+  { "resend": { "from": "sent1.message", "take": true }, "count": 2,
+    "pools": { "sent2": { "message": "$message" } } },
+  { "resend": { "from": "sent2.message", "take": true }, "count": 2 }
+]
+```
+
+Copies are mixed in with the other messages rather than sent right after their original.
+
+**Only the id matches.** When the consumer compares only an id header, the rest of each message can change:
+
+- **A fixed id:** one event with `"headers": { "message-id": { "static": "dup-test-0001" } }` and a `count`. The id is the same on every run, so a consumer that remembers ids will skip all of them on the next run, including the first. Change the id or clear the consumer's store between runs.
+- **A new id each run:** a dataset with one record, read by the header:
+
+  ```json
+  "datasets": { "dup": { "size": 1, "fields": { "id": { "uuid": true } } } },
+  "events": [ { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "count": 3,
+    "headers": { "message-id": { "from": "dup.id" } } } ]
+  ```
+
 ## Example: plans/plan-datasets.json
 
 ```
@@ -480,6 +537,7 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - a dataset reads a pool, datasets depend on each other in a loop, or a derived dataset wants more records than its source has
 - an event adds to a dataset, or a dataset and a pool share a name
 - a pool is read but no event adds to it
+- a `resend` reads a dataset, names no record field, or reads a field that no event fills with `$message`; or a resend event has keys it can't use, such as `rules`, `key` or `proto`
 - a `unique` rule runs out of values, or a dataset `take` runs out of records
 - quotas don't fit the datasets and pools (see [Weights or quotas](#weights-or-quotas))
 

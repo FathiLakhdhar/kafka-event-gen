@@ -15,7 +15,22 @@ const D = plan.defaults || {};
 // the schema comes from a .proto source file or a compiled FileDescriptorSet, never both
 const bothSchemas = (o) => o.proto != null && o.descriptor != null;
 if (bothSchemas(D)) throw Error(`defaults: use either "proto" or "descriptor", not both`);
+// a resend event sends again a message stored in a pool with "$message"; it doesn't use defaults,
+// which would otherwise change the copy (a default topic or a fresh traceparent)
+const RESEND_KEYS = ["resend", "type", "topic", "headers", "pools", "count", "weight"];
+function resendEvent(e) {
+  const r = e.resend;
+  const label = e.type ?? `resend of ${JSON.stringify(typeof r === "string" ? r : r?.from)}`;
+  if (!r || typeof r !== "object" || typeof r.from !== "string" || Object.keys(r).some((k) => k !== "from" && k !== "take"))
+    throw Error(`${label}: "resend" needs { "from": "<pool>.<field>" } with an optional "take": true`);
+  const extra = Object.keys(e).filter((k) => !RESEND_KEYS.includes(k));
+  if (extra.length)
+    throw Error(`${label}: a resend event sends the stored message unchanged, so it can't have ${extra.map((k) => `"${k}"`).join(", ")}`);
+  return { type: label, topic: e.topic, count: e.count, weight: e.weight, resend: { from: r.from, take: !!r.take },
+    rules: {}, headers: clean(e.headers || {}), pools: e.pools ?? {} };
+}
 const events = plan.events.map((e) => {
+  if (e.resend != null) return resendEvent(e);
   if (bothSchemas(e)) throw Error(`${e.type}: use either "proto" or "descriptor", not both`);
   const m = { ...D, ...e, rules: clean({ ...D.rules, ...e.rules }), headers: clean({ ...D.headers, ...e.headers }) };
   if (e.proto != null) delete m.descriptor; // the event's own schema replaces the other kind from defaults
@@ -37,6 +52,7 @@ const events = plan.events.map((e) => {
   return m;
 });
 events.forEach((e) => {
+  if (e.resend) return;
   if (!e.type || !e.topic || !(e.proto || e.descriptor || e.payload))
     throw Error(`event needs type, topic, and a proto, a descriptor or a payload: ${JSON.stringify(e.type)}`);
   if (!["protobuf", "json"].includes(e.format)) throw Error(`${e.type}: "format" must be "protobuf" or "json"`);
@@ -409,7 +425,16 @@ const takes = new Map(); // subset of needs the event removes a record from
 events.forEach((e) => {
   const reads = [];
   let checkField;
-  if (e.payload) {
+  if (e.resend) {
+    const where = e.type.startsWith("resend of ") ? e.type : `${e.type} resend`;
+    const c = checkSpec(e.resend.from, where, e.resend.take);
+    if (c.kind !== "pool") throw Error(`${where}: "${c.name}" is a dataset; messages to resend are kept in pools`);
+    if (!parseSpec(e.resend.from).prop) throw Error(`${where}: name the record field that holds the message, e.g. "${c.name}.message"`);
+    reads.push({ key: parseSpec(e.resend.from).key, take: e.resend.take });
+    checkField = (p, where) => {
+      throw Error(`${where}: a resend event has no fields of its own; use "$message", "$header.<name>" or "$from.<pool>"`);
+    };
+  } else if (e.payload) {
     const paths = Object.keys(e.payload);
     for (const [p, r] of Object.entries(e.payload)) {
       const clash = paths.find((q) => q.startsWith(p + "."));
@@ -432,18 +457,28 @@ events.forEach((e) => {
         throw Error(`${e.type} rules.${p}: "field" rules only work in headers, payloads and datasets`);
     }
   }
-  for (const [h, r] of Object.entries(e.headers)) checkRule(r, `${e.type} headers.${h}`, reads);
+  for (const [h, r] of Object.entries(e.headers))
+    if (checkRule(r, `${e.type} headers.${h}`, reads) === "field" && e.resend)
+      throw Error(`${e.type} headers.${h}: "field" rules don't work on resend events`);
   if (e.key) checkField(e.key, `${e.type} key`);
   for (const [pn, add] of Object.entries(e.pools))
     for (const [k, src] of Object.entries(add)) {
       const where = `${e.type} pools.${pn}.${k}`;
-      if (src.startsWith("$header.")) continue;
+      if (src === "$message" || src.startsWith("$header.")) continue;
       if (src.startsWith("$from.")) reads.push({ key: parseSpec(src.slice(6)).key, take: false }), checkSpec(src.slice(6), where);
       else checkField(src, where);
     }
   needs.set(e, new Set(reads.map((x) => x.key)));
   takes.set(e, new Set(reads.filter((x) => x.take).map((x) => x.key)));
 });
+
+// a resend reads a record field that some event fills with "$message"
+for (const e of events) {
+  if (!e.resend) continue;
+  const { name, prop } = parseSpec(e.resend.from);
+  if (!events.some((x) => x.pools[name]?.[prop] === "$message"))
+    throw Error(`${e.type.startsWith("resend of ") ? e.type : `${e.type} resend`}: no event stores a message in "${name}.${prop}"; add "${prop}": "$message" to an event's pools.${name}`);
+}
 
 // every pool that is read needs an event that adds to it
 for (const c of Object.values(store)) {
@@ -571,8 +606,15 @@ function makeMessage(i) {
   picked = {};
 
   // obj: values the rules see; shown: what the dry run prints; bytes: what goes on the wire
-  let obj, shown, bytes;
-  if (e.payload) shown = obj = buildPayload(e);
+  let obj, shown, bytes, type = e.type, format = e.format, topic = e.topic, key;
+  const headers = {};
+  if (e.resend) {
+    const m = pick(e.resend.from, e.resend.take);
+    if (!m || !Buffer.isBuffer(m.value)) throw Error(`${e.type}: "${e.resend.from}" doesn't hold a stored message`);
+    ({ obj, shown, value: bytes, type, format, key } = m);
+    topic ??= m.topic;
+    Object.assign(headers, m.headers);
+  } else if (e.payload) shown = obj = buildPayload(e);
   else {
     const Type = typeOf(e);
     obj = gen(Type, e.rules);
@@ -585,10 +627,12 @@ function makeMessage(i) {
       shown = Type.toObject(Type.decode(bytes), VIEW);
     }
   }
-  if (e.format === "json") bytes = Buffer.from(JSON.stringify(shown));
-
-  const headers = {};
-  if (plan.typeHeader) headers[plan.typeHeader] = e.type;
+  if (!e.resend) {
+    if (e.format === "json") bytes = Buffer.from(JSON.stringify(shown));
+    if (plan.typeHeader) headers[plan.typeHeader] = e.type;
+    const k = e.key ? get(obj, e.key) : undefined;
+    key = k != null ? String(k) : null;
+  }
   for (const [h, r] of Object.entries(e.headers)) {
     const v = byRuleIn(`${e.type} headers.${h}`, r, obj); // applies "unique" like other rules
     if (v == null) throw Error(`${e.type} headers.${h}: rule produced no value`);
@@ -598,7 +642,8 @@ function makeMessage(i) {
   for (const [pn, add] of Object.entries(e.pools)) {
     const rec = {};
     for (const [k, src] of Object.entries(add))
-      rec[k] = src.startsWith("$header.") ? headers[src.slice(8)]
+      rec[k] = src === "$message" ? { topic, key, value: bytes, headers: { ...headers }, shown, obj, type, format }
+        : src.startsWith("$header.") ? headers[src.slice(8)]
         : src.startsWith("$from.") ? pick(src.slice(6), false)
         : get(obj, src);
     addRecord(store[pn], rec);
@@ -607,13 +652,12 @@ function makeMessage(i) {
   if (plan.outDir) {
     const dir = path.resolve(planDir, plan.outDir);
     fs.mkdirSync(dir, { recursive: true });
-    const short = e.type.split(".").pop();
-    const ext = e.format === "json" ? "json" : "protobin";
+    const short = type.split(".").pop();
+    const ext = format === "json" ? "json" : "protobin";
     fs.writeFileSync(path.join(dir, `${String(i + 1).padStart(4, "0")}-${short}.${ext}`), bytes);
   }
 
-  const k = e.key ? get(obj, e.key) : undefined;
-  return { topic: e.topic, shown, msg: { key: k != null ? String(k) : null, value: bytes, headers } };
+  return { topic, shown, msg: { key, value: bytes, headers } };
 }
 
 // ---- run ----
