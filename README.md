@@ -1,4 +1,4 @@
-# kafka-proto-gen
+# kafka-event-gen
 
 Generates fake events from a JSON plan and publishes them to Kafka, or prints them for a dry run. Payloads can be binary Protobuf, Protobuf encoded as JSON, or schemaless JSON.
 
@@ -23,25 +23,25 @@ To run it from the clone:
 npm install
 ```
 
-To use it as a `kafka-proto-gen` command from any folder, install it globally, either from your clone or straight from GitHub:
+To use it as a `kafka-event-gen` command from any folder, install it globally, either from your clone or straight from GitHub:
 
 ```sh
 npm link                                                  # from the clone; follows your edits
-npm install -g github:FathiLakhdhar/kafka-proto-gen       # from GitHub, without cloning
+npm install -g github:FathiLakhdhar/kafka-event-gen       # from GitHub, without cloning
 ```
 
-`npm uninstall -g kafka-proto-gen` removes the command. The package is marked private, so it can't be published to npm by accident.
+`npm uninstall -g kafka-event-gen` removes the command. The package is marked private, so it can't be published to npm by accident.
 
 ## Usage
 
 ```sh
-kafka-proto-gen path/to/plan.json                                         # runs a plan
-kafka-proto-gen path/to/plan.json --dry-run                               # prints instead of sending
-kafka-proto-gen path/to/plan.json --connection connections/staging.json   # sends to another cluster
-kafka-proto-gen --help
+kafka-event-gen path/to/plan.json                                         # runs a plan
+kafka-event-gen path/to/plan.json --dry-run                               # prints instead of sending
+kafka-event-gen path/to/plan.json --connection connections/staging.json   # sends to another cluster
+kafka-event-gen --help
 ```
 
-Without the global install, use `node plan.js` in place of `kafka-proto-gen`. `npm start` runs `plans/plan.json`.
+Without the global install, use `node plan.js` in place of `kafka-event-gen`. `npm start` runs `plans/plan.json`.
 
 `--connection` names a file with the Kafka connection settings, so the same plan runs against any cluster without editing it (see [Secured clusters](#secured-clusters)). Without it, the plan's own `brokers` are used. At startup the run prints where it connects, e.g. `connecting to b1:9093, b2:9093 (TLS, SASL scram-sha-512, from connections/staging.json)`.
 
@@ -53,7 +53,7 @@ npm start > out.jsonl
 
 Press Ctrl+C once to stop after the current batch, or twice to force quit.
 
-Errors print as one line, like `Error: shop.OrderPaid rules: no field "ordrId" in shop.OrderPaid`, and the exit code is 1. Set `KAFKA_PROTO_GEN_DEBUG=1` to see the stack trace as well.
+Errors print as one line, like `Error: shop.OrderPaid rules: no field "ordrId" in shop.OrderPaid`, and the exit code is 1. Set `KAFKA_EVENT_GEN_DEBUG=1` to see the stack trace as well.
 
 ## Project layout
 
@@ -87,7 +87,7 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 | Key          | Description |
 |--------------|-------------|
 | `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]`. Used when there's no `--connection` file |
-| `clientId`   | Kafka client id (default `kafka-proto-gen`) |
+| `clientId`   | Kafka client id (default `kafka-event-gen`) |
 | `ssl`        | `true` for TLS with the system's CAs, or TLS options like `{ "ca": ..., "rejectUnauthorized": true }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
 | `sasl`       | SASL login, e.g. `{ "mechanism": "scram-sha-512", "username": ..., "password": ... }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
 | `count`      | Total number of messages to generate. Required with weights; optional with quotas, where it must equal the sum of event counts |

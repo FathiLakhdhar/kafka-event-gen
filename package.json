@@ -1,10 +1,9 @@
 {
-  "name": "kafka-proto-gen",
+  "name": "kafka-event-gen",
   "version": "1.0.0",
   "private": true,
-  "main": "plan.js",
   "bin": {
-    "kafka-proto-gen": "plan.js"
+    "kafka-event-gen": "plan.js"
   },
   "scripts": {
     "start": "node plan.js plans/plan.json"

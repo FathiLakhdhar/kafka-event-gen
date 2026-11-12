@@ -6,17 +6,17 @@ const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
 const path = require("path");
 
-// ---- command line: kafka-proto-gen <plan.json> [--connection <file>] [--dry-run] ----
-// errors before the run starts are shown as one line; set KAFKA_PROTO_GEN_DEBUG=1 for the stack trace
+// ---- command line: kafka-event-gen <plan.json> [--connection <file>] [--dry-run] ----
+// errors before the run starts are shown as one line; set KAFKA_EVENT_GEN_DEBUG=1 for the stack trace
 process.on("uncaughtException", (err) => {
-  let text = process.env.KAFKA_PROTO_GEN_DEBUG ? err.stack : `Error: ${err.message}`;
+  let text = process.env.KAFKA_EVENT_GEN_DEBUG ? err.stack : `Error: ${err.message}`;
   try {
     text = redact(text);
   } catch {} // the error came before redaction was set up, so there's nothing to hide yet
   console.error(text);
   process.exit(1);
 });
-const USAGE = "usage: kafka-proto-gen <plan.json> [--connection <file>] [--dry-run]";
+const USAGE = "usage: kafka-event-gen <plan.json> [--connection <file>] [--dry-run]";
 const HELP = `${USAGE}
 
 Generates events from a plan and sends them to Kafka, or prints them.
@@ -811,7 +811,7 @@ function kafkaConfig() {
   const brokers = withEnv(conn.brokers, "brokers", false);
   if (!Array.isArray(brokers) || !brokers.length) throw Error(`"brokers" must be a list like ["localhost:9092"]`);
   const config = {
-    clientId: withEnv(conn.clientId || "kafka-proto-gen", "clientId", false),
+    clientId: withEnv(conn.clientId || "kafka-event-gen", "clientId", false),
     brokers: brokers.flatMap((b) => String(b).split(",")).map((b) => b.trim()).filter(Boolean), // one variable can hold "host1:9093,host2:9093"
     logCreator: () => ({ namespace, label, log }) => {
       const { message, timestamp, logger, stack, ...extra } = log;
