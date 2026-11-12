@@ -5,9 +5,23 @@ const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
 const path = require("path");
 
-const planPath = path.resolve(process.argv[2] || "plans/plan.json");
+// ---- command line: node plan.js [plan.json] [--connection <file>] [--dry-run] ----
+const USAGE = "usage: node plan.js [plan.json] [--connection <file>] [--dry-run]";
+const cli = { plan: null, connection: null, dryRun: false };
+for (let i = 2, args = process.argv; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--dry-run") cli.dryRun = true;
+  else if (a === "--connection" || a.startsWith("--connection=")) {
+    cli.connection = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
+    if (!cli.connection || cli.connection.startsWith("--")) throw Error(`--connection needs a file name\n${USAGE}`);
+  } else if (a.startsWith("-")) throw Error(`unknown option ${a}\n${USAGE}`);
+  else if (cli.plan) throw Error(`only one plan file, got ${cli.plan} and ${a}\n${USAGE}`);
+  else cli.plan = a;
+}
+const planPath = path.resolve(cli.plan || "plans/plan.json");
 const planDir = path.dirname(planPath);
 const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+const dryRun = cli.dryRun || !!plan.dryRun;
 
 // ---- merge defaults + events ----
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null));
@@ -714,9 +728,28 @@ function withEnv(v, where, hide, secret = false) {
   return v;
 }
 
+// where to connect: a --connection file replaces the plan's brokers, clientId, ssl and sasl as a whole
+const CONNECTION_KEYS = ["brokers", "clientId", "ssl", "sasl"];
+const conn = (() => {
+  if (!cli.connection) return { ...Object.fromEntries(CONNECTION_KEYS.map((k) => [k, plan[k]])), from: "the plan" };
+  let c;
+  try {
+    c = JSON.parse(fs.readFileSync(path.resolve(cli.connection), "utf8"));
+  } catch (err) {
+    throw Error(`--connection ${cli.connection}: ${err.code === "ENOENT" ? "no such file" : err.message}`);
+  }
+  if (!c || typeof c !== "object" || Array.isArray(c)) throw Error(`--connection ${cli.connection}: expected a JSON object`);
+  const extra = Object.keys(c).filter((k) => !CONNECTION_KEYS.includes(k));
+  if (extra.length)
+    throw Error(`--connection ${cli.connection}: only ${CONNECTION_KEYS.join(", ")} go in a connection file, not ${extra.join(", ")}`);
+  const ignored = CONNECTION_KEYS.filter((k) => plan[k] != null);
+  if (ignored.length) console.error(`note: using ${cli.connection}; the plan's ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored`);
+  return { ...c, from: cli.connection };
+})();
+
 // checked at startup, also in a dry run (which doesn't read the environment, since it doesn't connect)
 function checkConnection() {
-  const { ssl, sasl } = plan;
+  const { ssl, sasl } = conn;
   if (ssl != null && typeof ssl !== "boolean" && (typeof ssl !== "object" || Array.isArray(ssl)))
     throw Error(`"ssl" must be true, false or an object of TLS options like { "ca": ..., "rejectUnauthorized": true }`);
   if (sasl != null) {
@@ -738,10 +771,10 @@ function checkConnection() {
 checkConnection();
 
 function kafkaConfig() {
-  const brokers = withEnv(plan.brokers, "brokers", false);
+  const brokers = withEnv(conn.brokers, "brokers", false);
   if (!Array.isArray(brokers) || !brokers.length) throw Error(`"brokers" must be a list like ["localhost:9092"]`);
   const config = {
-    clientId: withEnv(plan.clientId || "kafka-proto-gen", "clientId", false),
+    clientId: withEnv(conn.clientId || "kafka-proto-gen", "clientId", false),
     brokers: brokers.flatMap((b) => String(b).split(",")).map((b) => b.trim()).filter(Boolean), // one variable can hold "host1:9093,host2:9093"
     logCreator: () => ({ namespace, label, log }) => {
       const { message, timestamp, logger, stack, ...extra } = log;
@@ -749,15 +782,15 @@ function kafkaConfig() {
       console.error(redact(`kafkajs ${label} ${namespace}: ${message}${rest}`));
     },
   };
-  if (plan.ssl != null) {
-    config.ssl = typeof plan.ssl === "object" ? withEnv(plan.ssl, "ssl", true) : plan.ssl;
+  if (conn.ssl != null) {
+    config.ssl = typeof conn.ssl === "object" ? withEnv(conn.ssl, "ssl", true) : conn.ssl;
     for (const k of ["ca", "cert", "key"])
       for (const pem of [config.ssl[k]].flat().filter((x) => typeof x === "string"))
         if (!pem.includes("-----BEGIN"))
           throw Error(`ssl.${k}: expected PEM text (starting with -----BEGIN), not a file path; put the file's contents in an environment variable and use "\${ENV:NAME}"`);
   }
-  if (plan.sasl != null) {
-    const sasl = withEnv(plan.sasl, "sasl", true);
+  if (conn.sasl != null) {
+    const sasl = withEnv(conn.sasl, "sasl", true);
     sasl.mechanism = sasl.mechanism.toLowerCase();
     if (sasl.mechanism === "oauthbearer") {
       const value = sasl.token;
@@ -766,6 +799,8 @@ function kafkaConfig() {
     }
     config.sasl = sasl;
   }
+  const how = [config.ssl && "TLS", config.sasl && `SASL ${config.sasl.mechanism}`].filter(Boolean).join(", ") || "plaintext";
+  console.error(`connecting to ${config.brokers.join(", ")} (${how}, from ${conn.from})`);
   return config;
 }
 
@@ -780,7 +815,7 @@ process.on("SIGINT", () => {
 (async () => {
   let producer;
   try {
-    if (!plan.dryRun) {
+    if (!dryRun) {
       producer = new Kafka(kafkaConfig()).producer({ createPartitioner: Partitioners.DefaultPartitioner });
       await producer.connect();
     }
@@ -791,7 +826,7 @@ process.on("SIGINT", () => {
       const n = Math.min(rate, total - sent);
       const batch = Array.from({ length: n }, (_, j) => makeMessage(sent + j));
 
-      if (plan.dryRun) {
+      if (dryRun) {
         batch.forEach((b) => console.log(JSON.stringify({
           topic: b.topic, key: b.msg.key, headers: b.msg.headers, value: b.shown,
         })));
@@ -806,7 +841,7 @@ process.on("SIGINT", () => {
       sent += n;
       console.error(`sent ${sent}/${total}`);
       const wait = 1000 - (Date.now() - t0);
-      if (!plan.dryRun && sent < total && !stopping && wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (!dryRun && sent < total && !stopping && wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   } catch (err) {
     console.error(redact(err.message || err));

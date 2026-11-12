@@ -26,9 +26,13 @@ npm install
 ```sh
 npm start                        # runs plans/plan.json
 node plan.js path/to/plan.json   # runs any plan
+node plan.js path/to/plan.json --dry-run                               # prints instead of sending
+node plan.js path/to/plan.json --connection connections/staging.json   # sends to another cluster
 ```
 
-With `"dryRun": true`, each message is printed to stdout as one JSON line, after encoding and decoding it, so you see exactly what would go on the wire. Progress and dataset sizes go to stderr, which keeps the output clean:
+`--connection` names a file with the Kafka connection settings, so the same plan runs against any cluster without editing it (see [Secured clusters](#secured-clusters)). Without it, the plan's own `brokers` are used. At startup the run prints where it connects, e.g. `connecting to b1:9093, b2:9093 (TLS, SASL scram-sha-512, from connections/staging.json)`.
+
+With `--dry-run` or `"dryRun": true`, each message is printed to stdout as one JSON line, after encoding and decoding it, so you see exactly what would go on the wire. Progress and dataset sizes go to stderr, which keeps the output clean:
 
 ```sh
 npm start > out.jsonl
@@ -67,13 +71,13 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 
 | Key          | Description |
 |--------------|-------------|
-| `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]` |
+| `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]`. Used when there's no `--connection` file |
 | `clientId`   | Kafka client id (default `kafka-proto-gen`) |
-| `ssl`        | `true` for TLS with the system's CAs, or TLS options like `{ "ca": ..., "rejectUnauthorized": true }` (see [Secured clusters](#secured-clusters)) |
-| `sasl`       | SASL login, e.g. `{ "mechanism": "scram-sha-512", "username": ..., "password": ... }` (see [Secured clusters](#secured-clusters)) |
+| `ssl`        | `true` for TLS with the system's CAs, or TLS options like `{ "ca": ..., "rejectUnauthorized": true }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
+| `sasl`       | SASL login, e.g. `{ "mechanism": "scram-sha-512", "username": ..., "password": ... }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
 | `count`      | Total number of messages to generate. Required with weights; optional with quotas, where it must equal the sum of event counts |
 | `ratePerSec` | Messages per one-second batch (default: all at once) |
-| `dryRun`     | `true` prints messages instead of sending them (no pause between batches) |
+| `dryRun`     | `true` prints messages instead of sending them (no pause between batches). `--dry-run` does the same without editing the plan |
 | `outDir`     | If set, also writes each encoded message to `NNNN-<Type>.protobin` |
 | `typeHeader` | If set, adds a header with this name holding the full message type |
 | `clock`      | Fixed "now" for every date, e.g. `"2026-01-01T00:00:00Z"`, so dates are the same on every run (see [Dates and times](#dates-and-times)) |
@@ -86,18 +90,22 @@ Paths in `proto`, `descriptor` and `outDir` are relative to the **plan file**, n
 
 ### Secured clusters
 
-Without `ssl` and `sasl` the tool connects in plaintext. Add either or both for a secured cluster, and read credentials from the environment with `${ENV:NAME}` so the plan file holds no secrets:
+Keep the connection out of the plan: put it in a connection file per cluster and pick one with `--connection`. A connection file holds only `brokers`, `clientId`, `ssl` and `sasl`, and reads credentials from the environment with `${ENV:NAME}`, so it holds no secrets either:
 
 ```json
-"brokers": ["${ENV:KAFKA_BROKERS}"],
-"ssl": true,
-"sasl": { "mechanism": "scram-sha-512", "username": "${ENV:KAFKA_USER}", "password": "${ENV:KAFKA_PASSWORD}" }
+{
+  "brokers": ["${ENV:KAFKA_BROKERS}"],
+  "ssl": true,
+  "sasl": { "mechanism": "scram-sha-512", "username": "${ENV:KAFKA_USER}", "password": "${ENV:KAFKA_PASSWORD}" }
+}
 ```
 
 ```sh
 export KAFKA_BROKERS=broker-1:9093,broker-2:9093 KAFKA_USER=generator KAFKA_PASSWORD=...
-node plan.js plans/plan.json
+node plan.js plans/plan.json --connection connections/staging.json
 ```
+
+A connection file replaces all of the plan's `brokers`, `clientId`, `ssl` and `sasl`. They aren't merged, and a note says which plan settings are ignored. Without `--connection` the same four settings are read from the plan, which is handy for a local broker. Without `ssl` and `sasl` the connection is plaintext.
 
 `${ENV:NAME}` works in any string of `brokers`, `clientId`, `ssl` and `sasl`. A broker entry can hold a comma-separated list, as above.
 
@@ -112,7 +120,7 @@ node plan.js plans/plan.json
 Secrets stay out of the output:
 
 - the password, token, private keys and every value read from the environment for `ssl` or `sasl` show as `***` in errors and in the Kafka client's log lines, which go to stderr
-- a dry run doesn't connect, so it doesn't read these variables and runs without them
+- a dry run (`--dry-run`) doesn't connect, so it doesn't read these variables and runs without them
 - a secret written straight into the plan still works, but prints a warning at startup
 
 The tool doesn't decrypt or store secrets. It only reads them from the environment of the run, so use whatever already holds them to fill that environment for one command:
@@ -600,6 +608,7 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
 - an `iso` value isn't one of the forms in [Dates and times](#dates-and-times) (`"nwo"`, `"now+7y"`), a range ends before it starts, `precision` is unknown or used on a rule other than `iso`, an epoch `precision` is used on a Timestamp field, or `clock` isn't a date-time with a time zone
+- the command line has an unknown option or two plan files, or the `--connection` file is missing, isn't a JSON object, or has keys other than `brokers`, `clientId`, `ssl` and `sasl`
 - `ssl` isn't `true`, `false` or an object, `sasl.mechanism` is unknown, or a mechanism is missing a field it needs
 - a `${ENV:NAME}` variable isn't set or is empty (the error names the variable, never its value), or `ssl.ca`, `cert` or `key` is a file path instead of PEM text. These are checked when connecting, so a dry run skips them
 - `optional` isn't `true` or `false`, or is used on something other than a header's rule
