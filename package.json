@@ -1,14 +1,17 @@
 {
-  "name": "kafka-proto-gen",
+  "name": "kafka-event-gen",
   "version": "1.0.0",
-  "main": "plan.js",
+  "private": true,
+  "bin": {
+    "kafka-event-gen": "plan.js"
+  },
   "scripts": {
     "start": "node plan.js plans/plan.json"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Generates fake Protobuf and JSON events from a plan and sends them to Kafka",
   "dependencies": {
     "@faker-js/faker": "^10.6.0",
     "kafkajs": "^2.2.4",

@@ -1,6 +1,6 @@
 {
   "brokers": ["localhost:9092"],
-  "clientId": "kafka-proto-gen",
+  "clientId": "kafka-event-gen",
   "count": 1000,
   "ratePerSec": 50,
   "dryRun": true,

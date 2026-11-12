@@ -1,25 +1,100 @@
+#!/usr/bin/env node
 const protobuf = require("protobufjs");
+const protobufDescriptor = require("protobufjs/ext/descriptor");
 const { faker, allFakers } = require("@faker-js/faker");
 const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
 const path = require("path");
 
-const planPath = path.resolve(process.argv[2] || "plans/plan.json");
+// ---- command line: kafka-event-gen <plan.json> [--connection <file>] [--dry-run] ----
+// errors before the run starts are shown as one line; set KAFKA_EVENT_GEN_DEBUG=1 for the stack trace
+process.on("uncaughtException", (err) => {
+  let text = process.env.KAFKA_EVENT_GEN_DEBUG ? err.stack : `Error: ${err.message}`;
+  try {
+    text = redact(text);
+  } catch {} // the error came before redaction was set up, so there's nothing to hide yet
+  console.error(text);
+  process.exit(1);
+});
+const USAGE = "usage: kafka-event-gen <plan.json> [--connection <file>] [--dry-run]";
+const HELP = `${USAGE}
+
+Generates events from a plan and sends them to Kafka, or prints them.
+
+  <plan.json>          the plan to run
+  --connection <file>  Kafka connection settings (brokers, clientId, ssl, sasl); default: the plan's
+  --dry-run            print the messages as JSON lines instead of sending them
+  --help               show this help
+  --version            show the version`;
+const cli = { plan: null, connection: null, dryRun: false };
+for (let i = 2, args = process.argv; i < args.length; i++) {
+  const a = args[i];
+  if (a === "--help" || a === "-h") {
+    console.log(HELP);
+    process.exit(0);
+  }
+  if (a === "--version" || a === "-v") {
+    console.log(require("./package.json").version);
+    process.exit(0);
+  }
+  if (a === "--dry-run") cli.dryRun = true;
+  else if (a === "--connection" || a.startsWith("--connection=")) {
+    cli.connection = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
+    if (!cli.connection || cli.connection.startsWith("--")) throw Error(`--connection needs a file name\n${USAGE}`);
+  } else if (a.startsWith("-")) throw Error(`unknown option ${a}\n${USAGE}`);
+  else if (cli.plan) throw Error(`only one plan file, got ${cli.plan} and ${a}\n${USAGE}`);
+  else cli.plan = a;
+}
+if (!cli.plan) {
+  console.error(`${USAGE}\n(--help for details)`);
+  process.exit(1);
+}
+const planPath = path.resolve(cli.plan);
 const planDir = path.dirname(planPath);
-const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+const plan = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(planPath, "utf8"));
+  } catch (err) {
+    throw Error(`${cli.plan}: ${err.code === "ENOENT" ? "no such file" : err.message}`);
+  }
+})();
+const dryRun = cli.dryRun || !!plan.dryRun;
 
 // ---- merge defaults + events ----
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null));
 const D = plan.defaults || {};
+// the schema comes from a .proto source file or a compiled FileDescriptorSet, never both
+const bothSchemas = (o) => o.proto != null && o.descriptor != null;
+if (bothSchemas(D)) throw Error(`defaults: use either "proto" or "descriptor", not both`);
+// a resend event sends again a message stored in a pool with "$message"; it doesn't use defaults,
+// which would otherwise change the copy (a default topic or a fresh traceparent)
+const RESEND_KEYS = ["resend", "type", "topic", "headers", "pools", "count", "weight"];
+function resendEvent(e) {
+  const r = e.resend;
+  const label = e.type ?? `resend of ${JSON.stringify(typeof r === "string" ? r : r?.from)}`;
+  if (!r || typeof r !== "object" || typeof r.from !== "string" || Object.keys(r).some((k) => k !== "from" && k !== "take"))
+    throw Error(`${label}: "resend" needs { "from": "<pool>.<field>" } with an optional "take": true`);
+  const extra = Object.keys(e).filter((k) => !RESEND_KEYS.includes(k));
+  if (extra.length)
+    throw Error(`${label}: a resend event sends the stored message unchanged, so it can't have ${extra.map((k) => `"${k}"`).join(", ")}`);
+  return { type: label, topic: e.topic, count: e.count, weight: e.weight, resend: { from: r.from, take: !!r.take },
+    rules: {}, headers: clean(e.headers || {}), pools: e.pools ?? {} };
+}
 const events = plan.events.map((e) => {
+  if (e.resend != null) return resendEvent(e);
+  if (bothSchemas(e)) throw Error(`${e.type}: use either "proto" or "descriptor", not both`);
   const m = { ...D, ...e, rules: clean({ ...D.rules, ...e.rules }), headers: clean({ ...D.headers, ...e.headers }) };
+  if (e.proto != null) delete m.descriptor; // the event's own schema replaces the other kind from defaults
+  if (e.descriptor != null) delete m.proto;
   if (e.payload) { // schemaless JSON event: the payload rules replace the proto schema
-    if (e.proto || e.rules) throw Error(`${e.type}: an event with "payload" can't also have "proto" or "rules"`);
+    if (e.proto || e.descriptor || e.rules)
+      throw Error(`${e.type}: an event with "payload" can't also have "proto", "descriptor" or "rules"`);
     if (m.format && m.format !== "json") throw Error(`${e.type}: an event with "payload" is always sent as JSON`);
     m.payload = clean({ ...D.payload, ...e.payload });
     m.format = "json";
     m.rules = {};
     delete m.proto;
+    delete m.descriptor;
   } else delete m.payload;
   m.format ??= "protobuf";
   if (m.pool) m.pools = { ...m.pools, [m.pool.name]: m.pool.add }; // old single-pool syntax
@@ -28,8 +103,9 @@ const events = plan.events.map((e) => {
   return m;
 });
 events.forEach((e) => {
-  if (!e.type || !e.topic || !(e.proto || e.payload))
-    throw Error(`event needs type, topic, and a proto or a payload: ${JSON.stringify(e.type)}`);
+  if (e.resend) return;
+  if (!e.type || !e.topic || !(e.proto || e.descriptor || e.payload))
+    throw Error(`event needs type, topic, and a proto, a descriptor or a payload: ${JSON.stringify(e.type)}`);
   if (!["protobuf", "json"].includes(e.format)) throw Error(`${e.type}: "format" must be "protobuf" or "json"`);
 });
 
@@ -49,22 +125,51 @@ if (!quotas && !(Number.isInteger(plan.count) && plan.count > 0))
   throw Error(`plan needs a positive "count" (or a "count" on every event)`);
 const left = new Map(events.map((e) => [e, e.count]));
 
-// ---- proto loading ----
+// ---- proto loading: .proto source files or binary FileDescriptorSets ----
 const roots = {};
 const types = {};
-const typeOf = (e) => (types[e.proto + "|" + e.type] ??= (() => {
-  const file = path.resolve(planDir, e.proto);
-  const root = (roots[file] ??= protobuf.loadSync(file).resolveAll());
-  return root.lookupType(e.type);
-})());
+function loadRoot(src, isDescriptor) {
+  const file = path.resolve(planDir, src);
+  return (roots[file] ??= (() => {
+    const what = isDescriptor ? "descriptor" : "proto";
+    if (isDescriptor && !fs.existsSync(file)) throw Error(`${what} "${src}": no file at ${file}`);
+    let set;
+    try {
+      if (isDescriptor) set = protobufDescriptor.FileDescriptorSet.decode(fs.readFileSync(file));
+    } catch (err) {
+      throw Error(`${what} "${src}": not a binary FileDescriptorSet (${err.message}); ` +
+        `build it with protoc --include_imports --descriptor_set_out=<file>`);
+    }
+    try {
+      return (isDescriptor ? protobuf.Root.fromDescriptor(set) : protobuf.loadSync(file)).resolveAll();
+    } catch (err) {
+      const hint = isDescriptor && /no such type/i.test(err.message)
+        ? " (build the descriptor set with protoc --include_imports so imported types are in it)" : "";
+      throw Error(`${what} "${src}": ${err.message}${hint}`);
+    }
+  })());
+}
+const typeOf = (e) => {
+  const src = e.descriptor ?? e.proto;
+  return (types[src + "|" + e.type] ??= (() => {
+    const t = loadRoot(src, e.descriptor != null).lookup(e.type);
+    if (!(t instanceof protobuf.Type))
+      throw Error(`${e.type}: no message type with this name in ${e.descriptor != null ? "descriptor" : "proto"} "${src}"`);
+    return t;
+  })());
+};
 
 // ---- helpers ----
 const get = (o, p) => p.split(".").reduce((a, k) => a?.[k], o);
 const hex = (n) => faker.string.hexadecimal({ length: n, casing: "lower", prefix: "" });
 const isTs = (t) => t && t.fullName === ".google.protobuf.Timestamp";
+// a date, ISO string or epoch millis; a value already in Timestamp form (e.g. read from a pool) is kept
 const toTs = (d) => {
+  if (d && typeof d === "object" && !(d instanceof Date) && "seconds" in d) return { seconds: d.seconds, nanos: d.nanos ?? 0 };
   const ms = new Date(d).getTime();
-  return { seconds: Math.floor(ms / 1000), nanos: (ms % 1000) * 1e6 };
+  if (Number.isNaN(ms)) throw Error(`${JSON.stringify(d)} isn't a date, so it can't be a google.protobuf.Timestamp`);
+  const seconds = Math.floor(ms / 1000);
+  return { seconds, nanos: (ms - seconds * 1000) * 1e6 };
 };
 const fakerFn = (p, fk = faker) => {
   const i = p.lastIndexOf(".");
@@ -72,6 +177,59 @@ const fakerFn = (p, fk = faker) => {
   const fn = mod?.[p.slice(i + 1)];
   return typeof fn === "function" ? fn.bind(mod) : null;
 };
+
+// ---- time ----
+// "now" is the plan's fixed "clock" if it has one, otherwise the real time when each value is made
+let clockMs = null;
+if (plan.clock != null) {
+  const ok = typeof plan.clock === "string" && /^\d{4}-\d{2}-\d{2}T.*(Z|[+-]\d{2}:\d{2})$/.test(plan.clock);
+  clockMs = ok ? Date.parse(plan.clock) : NaN;
+  if (Number.isNaN(clockMs))
+    throw Error(`"clock" must be an ISO date-time with a time zone, like "2026-01-01T00:00:00Z"; got ${JSON.stringify(plan.clock)}`);
+  for (const f of [faker, ...Object.values(allFakers)]) f.setDefaultRefDate(new Date(clockMs)); // past, future, recent
+}
+const nowMs = () => clockMs ?? Date.now();
+const UNIT = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5 };
+const TIME = /^(now|today)((?:[+-]\d+[smhdw])*)$/;
+const isTime = (t) => typeof t === "string" && TIME.test(t);
+// "now" or "today" (midnight UTC), plus any number of signed offsets: "now+7d", "today-1d+9h"
+function timeOf(token) {
+  const [, base, offsets] = token.match(TIME);
+  let t = nowMs();
+  if (base === "today") t = Math.floor(t / UNIT.d) * UNIT.d;
+  for (const [, sign, n, u] of offsets.matchAll(/([+-])(\d+)([smhdw])/g)) t += (sign === "-" ? -1 : 1) * n * UNIT[u];
+  return t;
+}
+const PRECISIONS = ["millis", "seconds", "date", "epochMillis", "epochSeconds"];
+function isoValue(r) {
+  let ms;
+  if (Array.isArray(r.iso)) {
+    const [from, to] = r.iso.map(timeOf);
+    if (from > to) throw Error(`iso range ${JSON.stringify(r.iso)} ends before it starts`);
+    ms = faker.date.between({ from, to }).getTime();
+  } else if (["past", "future", "recent"].includes(r.iso)) ms = faker.date[r.iso]().getTime();
+  else ms = timeOf(r.iso);
+  const secs = Math.floor(ms / 1000);
+  switch (r.precision ?? "millis") {
+    case "seconds": return new Date(secs * 1000).toISOString().replace(".000Z", "Z");
+    case "date": return new Date(ms).toISOString().slice(0, 10);
+    case "epochMillis": return ms;
+    case "epochSeconds": return secs;
+    default: return new Date(ms).toISOString();
+  }
+}
+function checkIso(r, where) {
+  const v = r.iso;
+  if (Array.isArray(v)) {
+    if (v.length !== 2 || !v.every(isTime))
+      throw Error(`${where}: an iso range needs two times like ["now", "now+7d"], got ${JSON.stringify(v)}`);
+    if (timeOf(v[0]) > timeOf(v[1])) throw Error(`${where}: iso range ${JSON.stringify(v)} ends before it starts`);
+  } else if (!["past", "future", "recent"].includes(v) && !isTime(v))
+    throw Error(`${where}: unknown iso value ${JSON.stringify(v)} (expected "past", "future", "recent", ` +
+      `"now" or "today" with optional offsets like "now+7d" or "today-1d+9h", or a range like ["now", "now+7d"])`);
+  if (r.precision != null && !PRECISIONS.includes(r.precision))
+    throw Error(`${where}: "precision" must be one of ${PRECISIONS.join(", ")}, got ${JSON.stringify(r.precision)}`);
+}
 
 // ---- collections: datasets (filled at startup) and pools (filled by events) ----
 // a collection holds records in sub-pools; without "split" it has one unnamed sub-pool ""
@@ -155,8 +313,7 @@ const mapKey = (t) => (t === "string" ? faker.word.noun() : String(scalar(t)));
 function byRule(r, obj) {
   if ("static" in r) return r.static;
   if (r.uuid) return faker.string.uuid();
-  if (r.iso) return (r.iso === "past" ? faker.date.past()
-    : r.iso === "future" ? faker.date.future() : faker.date.recent()).toISOString();
+  if ("iso" in r) return isoValue(r);
   if (r.regex) return faker.helpers.fromRegExp(r.regex);
   if (r.oneOf) return faker.helpers.arrayElement(r.oneOf);
   if (r.int) return faker.number.int({ min: r.int[0], max: r.int[1] });
@@ -166,8 +323,11 @@ function byRule(r, obj) {
   if (r.traceparent)
     return `00-${hex(32)}-${hex(16)}-${Math.random() < (r.traceparent.sampled ?? 1) ? "01" : "00"}`;
   if (specOf(r)) {
-    const v = pick(specOf(r), r.take) ?? (r.fallback ? byRule(r.fallback, obj) : undefined);
-    if (v === undefined) throw Error(`"${specOf(r)}" has no records left to read`);
+    const spec = specOf(r);
+    let v = pick(spec, r.take);
+    if (v == null && r.fallback) v = byRule(r.fallback, obj);
+    if (v == null && !(parseSpec(spec).key in picked)) throw Error(`"${spec}" has no records left to read`);
+    if (v == null && !r.optional) throw Error(`"${spec}": the record it read has no value there`);
     return v;
   }
   throw Error(`unknown rule ${JSON.stringify(r)}`);
@@ -198,6 +358,7 @@ function uniqueByRule(scope, r, obj) {
   const used = seen.get(scope) ?? seen.set(scope, new Set()).get(scope);
   for (let i = 0; i < 1000; i++) {
     const v = byRule(r, obj);
+    if (v == null) return v; // an optional header left out; nothing to keep unique
     const k = typeof v === "object" ? JSON.stringify(v) : v;
     if (!used.has(k)) return used.add(k), v;
   }
@@ -219,10 +380,23 @@ function checkSpec(spec, where, take) {
   return c;
 }
 // returns the rule kind; collects the keys the rule reads without a fallback into `reads`
-function checkRule(r, where, reads, inDataset = false) {
+function checkRule(r, where, reads, inDataset = false, inHeader = false) {
   if (!r || typeof r !== "object") throw Error(`${where}: rule must be an object, got ${JSON.stringify(r)}`);
   const kind = RULES.find((k) => k in r);
   if (!kind) throw Error(`${where}: unknown rule ${JSON.stringify(r)} (expected one of ${RULES.join(", ")})`);
+  if (r.optional != null) {
+    if (typeof r.optional !== "boolean") throw Error(`${where}: "optional" must be true or false`);
+    if (!inHeader) throw Error(`${where}: "optional" only works on a header's rule (not on fields, or inside a fallback or locale)`);
+  }
+  if (kind === "iso") checkIso(r, where);
+  else if (r.precision != null) throw Error(`${where}: "precision" only works with iso rules`);
+  if (kind === "traceparent" && typeof r.traceparent === "object") {
+    const { sampled, ...rest } = r.traceparent;
+    if (Object.keys(rest).length)
+      throw Error(`${where}: traceparent only takes "sampled", not ${Object.keys(rest).map((k) => `"${k}"`).join(", ")}`);
+    if (sampled != null && !(typeof sampled === "number" && sampled >= 0 && sampled <= 1))
+      throw Error(`${where}: traceparent "sampled" must be a chance between 0 and 1, got ${JSON.stringify(sampled)}`);
+  }
   if (kind === "faker" && !fakerFn(r.faker)) throw Error(`${where}: faker has no function "${r.faker}"`);
   if (r.locale != null) {
     if (kind !== "faker" && kind !== "email") throw Error(`${where}: "locale" only works with faker and email rules`);
@@ -244,6 +418,7 @@ function checkPath(type, p, where) {
     if (!f) throw Error(`${where}: no field "${p}" in ${type.fullName.slice(1)}`);
     t = f.resolvedType;
   }
+  return t;
 }
 
 // ---- datasets: check, order by dependency, build ----
@@ -316,7 +491,16 @@ const takes = new Map(); // subset of needs the event removes a record from
 events.forEach((e) => {
   const reads = [];
   let checkField;
-  if (e.payload) {
+  if (e.resend) {
+    const where = e.type.startsWith("resend of ") ? e.type : `${e.type} resend`;
+    const c = checkSpec(e.resend.from, where, e.resend.take);
+    if (c.kind !== "pool") throw Error(`${where}: "${c.name}" is a dataset; messages to resend are kept in pools`);
+    if (!parseSpec(e.resend.from).prop) throw Error(`${where}: name the record field that holds the message, e.g. "${c.name}.message"`);
+    reads.push({ key: parseSpec(e.resend.from).key, take: e.resend.take });
+    checkField = (p, where) => {
+      throw Error(`${where}: a resend event has no fields of its own; use "$message", "$header.<name>" or "$from.<pool>"`);
+    };
+  } else if (e.payload) {
     const paths = Object.keys(e.payload);
     for (const [p, r] of Object.entries(e.payload)) {
       const clash = paths.find((q) => q.startsWith(p + "."));
@@ -332,23 +516,35 @@ events.forEach((e) => {
     const Type = typeOf(e);
     checkField = (p, where) => checkPath(Type, p, where);
     for (const [p, r] of Object.entries(e.rules)) {
-      checkPath(Type, p, `${e.type} rules`);
+      const t = checkPath(Type, p, `${e.type} rules`);
+      if (isTs(t) && /^epoch/.test(r?.precision))
+        throw Error(`${e.type} rules.${p}: "precision": "${r.precision}" makes a number, which doesn't fit a google.protobuf.Timestamp`);
       if (checkRule(r, `${e.type} rules.${p}`, reads) === "field")
         throw Error(`${e.type} rules.${p}: "field" rules only work in headers, payloads and datasets`);
     }
   }
-  for (const [h, r] of Object.entries(e.headers)) checkRule(r, `${e.type} headers.${h}`, reads);
+  for (const [h, r] of Object.entries(e.headers))
+    if (checkRule(r, `${e.type} headers.${h}`, reads, false, true) === "field" && e.resend)
+      throw Error(`${e.type} headers.${h}: "field" rules don't work on resend events`);
   if (e.key) checkField(e.key, `${e.type} key`);
   for (const [pn, add] of Object.entries(e.pools))
     for (const [k, src] of Object.entries(add)) {
       const where = `${e.type} pools.${pn}.${k}`;
-      if (src.startsWith("$header.")) continue;
+      if (src === "$message" || src.startsWith("$header.")) continue;
       if (src.startsWith("$from.")) reads.push({ key: parseSpec(src.slice(6)).key, take: false }), checkSpec(src.slice(6), where);
       else checkField(src, where);
     }
   needs.set(e, new Set(reads.map((x) => x.key)));
   takes.set(e, new Set(reads.filter((x) => x.take).map((x) => x.key)));
 });
+
+// a resend reads a record field that some event fills with "$message"
+for (const e of events) {
+  if (!e.resend) continue;
+  const { name, prop } = parseSpec(e.resend.from);
+  if (!events.some((x) => x.pools[name]?.[prop] === "$message"))
+    throw Error(`${e.type.startsWith("resend of ") ? e.type : `${e.type} resend`}: no event stores a message in "${name}.${prop}"; add "${prop}": "$message" to an event's pools.${name}`);
+}
 
 // every pool that is read needs an event that adds to it
 for (const c of Object.values(store)) {
@@ -396,8 +592,13 @@ if (quotas) {
 function value(f, rules, depth, p) {
   const t = f.resolvedType;
   if (rules[p]) {
-    const v = byRuleIn(`${f.parent.fullName.slice(1)}.${f.name}`, rules[p]);
-    return isTs(t) ? toTs(v) : v;
+    const scope = `${f.parent.fullName.slice(1)}.${f.name}`;
+    const v = byRuleIn(scope, rules[p]);
+    try {
+      return isTs(t) ? toTs(v) : v;
+    } catch (err) {
+      throw Error(`${scope}: ${err.message}`);
+    }
   }
   if (isTs(t)) return toTs(faker.date.recent());
   if (t instanceof protobuf.Enum) {
@@ -471,8 +672,15 @@ function makeMessage(i) {
   picked = {};
 
   // obj: values the rules see; shown: what the dry run prints; bytes: what goes on the wire
-  let obj, shown, bytes;
-  if (e.payload) shown = obj = buildPayload(e);
+  let obj, shown, bytes, type = e.type, format = e.format, topic = e.topic, key;
+  const headers = {};
+  if (e.resend) {
+    const m = pick(e.resend.from, e.resend.take);
+    if (!m || !Buffer.isBuffer(m.value)) throw Error(`${e.type}: "${e.resend.from}" doesn't hold a stored message`);
+    ({ obj, shown, value: bytes, type, format, key } = m);
+    topic ??= m.topic;
+    Object.assign(headers, m.headers);
+  } else if (e.payload) shown = obj = buildPayload(e);
   else {
     const Type = typeOf(e);
     obj = gen(Type, e.rules);
@@ -485,20 +693,26 @@ function makeMessage(i) {
       shown = Type.toObject(Type.decode(bytes), VIEW);
     }
   }
-  if (e.format === "json") bytes = Buffer.from(JSON.stringify(shown));
-
-  const headers = {};
-  if (plan.typeHeader) headers[plan.typeHeader] = e.type;
+  if (!e.resend) {
+    if (e.format === "json") bytes = Buffer.from(JSON.stringify(shown));
+    if (plan.typeHeader) headers[plan.typeHeader] = e.type;
+    const k = e.key ? get(obj, e.key) : undefined;
+    key = k != null ? String(k) : null;
+  }
   for (const [h, r] of Object.entries(e.headers)) {
-    const v = byRule(r, obj);
-    if (v == null) throw Error(`${e.type} header ${h}: rule produced no value`);
+    const v = byRuleIn(`${e.type} headers.${h}`, r, obj); // applies "unique" like other rules
+    if (v == null) {
+      if (r.optional) continue; // left out (on a resend, the copied header stays)
+      throw Error(`${e.type} headers.${h}: rule produced no value; add "optional": true to leave the header out instead`);
+    }
     headers[h] = String(v);
   }
 
   for (const [pn, add] of Object.entries(e.pools)) {
     const rec = {};
     for (const [k, src] of Object.entries(add))
-      rec[k] = src.startsWith("$header.") ? headers[src.slice(8)]
+      rec[k] = src === "$message" ? { topic, key, value: bytes, headers: { ...headers }, shown, obj, type, format }
+        : src.startsWith("$header.") ? headers[src.slice(8)]
         : src.startsWith("$from.") ? pick(src.slice(6), false)
         : get(obj, src);
     addRecord(store[pn], rec);
@@ -507,13 +721,124 @@ function makeMessage(i) {
   if (plan.outDir) {
     const dir = path.resolve(planDir, plan.outDir);
     fs.mkdirSync(dir, { recursive: true });
-    const short = e.type.split(".").pop();
-    const ext = e.format === "json" ? "json" : "protobin";
+    const short = type.split(".").pop();
+    const ext = format === "json" ? "json" : "protobin";
     fs.writeFileSync(path.join(dir, `${String(i + 1).padStart(4, "0")}-${short}.${ext}`), bytes);
   }
 
-  const k = e.key ? get(obj, e.key) : undefined;
-  return { topic: e.topic, shown, msg: { key: k != null ? String(k) : null, value: bytes, headers } };
+  return { topic, shown, msg: { key, value: bytes, headers } };
+}
+
+// ---- Kafka connection: brokers, TLS and SASL ----
+// "${ENV:NAME}" in any of their strings reads an environment variable, so secrets stay out of the plan.
+// Values read for ssl and sasl, and every secret field, are replaced by *** in anything we print.
+const ENV_REF = /\$\{ENV:([A-Za-z_][A-Za-z0-9_]*)\}/g;
+const SECRET_KEYS = new Set(["password", "key", "passphrase", "secretAccessKey", "sessionToken", "token"]);
+const SASL_NEEDS = {
+  plain: ["username", "password"],
+  "scram-sha-256": ["username", "password"],
+  "scram-sha-512": ["username", "password"],
+  aws: ["authorizationIdentity", "accessKeyId", "secretAccessKey"],
+  oauthbearer: ["token"],
+};
+const secrets = new Set();
+// longest first, so a short value can't break up a longer one before it's replaced
+const redact = (text) => [...secrets].sort((a, b) => b.length - a.length).reduce((t, v) => t.split(v).join("***"), String(text));
+
+// resolves ${ENV:...} in every string of a value. In ssl and sasl (`hide`), secret fields and values
+// read from the environment are kept for redaction.
+function withEnv(v, where, hide, secret = false) {
+  if (typeof v === "string") {
+    const out = v.replace(ENV_REF, (_, name) => {
+      const val = process.env[name];
+      if (val == null || val === "") throw Error(`${where}: environment variable ${name} is ${val == null ? "not set" : "empty"}`);
+      return val;
+    });
+    if (/\$\{\s*env\s*:/i.test(v.replace(ENV_REF, "")))
+      throw Error(`${where}: write environment variables as \${ENV:NAME}, with NAME in letters, digits and _`);
+    if (hide && out && (secret || out !== v)) secrets.add(out);
+    return out;
+  }
+  if (Array.isArray(v)) return v.map((x, i) => withEnv(x, `${where}[${i}]`, hide, secret));
+  if (v && typeof v === "object")
+    return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, withEnv(x, `${where}.${k}`, hide, secret || SECRET_KEYS.has(k))]));
+  return v;
+}
+
+// where to connect: a --connection file replaces the plan's brokers, clientId, ssl and sasl as a whole
+const CONNECTION_KEYS = ["brokers", "clientId", "ssl", "sasl"];
+const conn = (() => {
+  if (!cli.connection) return { ...Object.fromEntries(CONNECTION_KEYS.map((k) => [k, plan[k]])), from: "the plan" };
+  let c;
+  try {
+    c = JSON.parse(fs.readFileSync(path.resolve(cli.connection), "utf8"));
+  } catch (err) {
+    throw Error(`--connection ${cli.connection}: ${err.code === "ENOENT" ? "no such file" : err.message}`);
+  }
+  if (!c || typeof c !== "object" || Array.isArray(c)) throw Error(`--connection ${cli.connection}: expected a JSON object`);
+  const extra = Object.keys(c).filter((k) => !CONNECTION_KEYS.includes(k));
+  if (extra.length)
+    throw Error(`--connection ${cli.connection}: only ${CONNECTION_KEYS.join(", ")} go in a connection file, not ${extra.join(", ")}`);
+  const ignored = CONNECTION_KEYS.filter((k) => plan[k] != null);
+  if (ignored.length) console.error(`note: using ${cli.connection}; the plan's ${ignored.join(", ")} ${ignored.length > 1 ? "are" : "is"} ignored`);
+  return { ...c, from: cli.connection };
+})();
+
+// checked at startup, also in a dry run (which doesn't read the environment, since it doesn't connect)
+function checkConnection() {
+  const { ssl, sasl } = conn;
+  if (ssl != null && typeof ssl !== "boolean" && (typeof ssl !== "object" || Array.isArray(ssl)))
+    throw Error(`"ssl" must be true, false or an object of TLS options like { "ca": ..., "rejectUnauthorized": true }`);
+  if (sasl != null) {
+    if (typeof sasl !== "object" || Array.isArray(sasl)) throw Error(`"sasl" must be an object like { "mechanism": "scram-sha-512", ... }`);
+    const mech = String(sasl.mechanism ?? "").toLowerCase();
+    if (!SASL_NEEDS[mech])
+      throw Error(`sasl.mechanism must be one of ${Object.keys(SASL_NEEDS).join(", ")}, got ${JSON.stringify(sasl.mechanism)}`);
+    for (const k of SASL_NEEDS[mech])
+      if (typeof sasl[k] !== "string" || !sasl[k]) throw Error(`sasl: "${mech}" needs "${k}" (e.g. "\${ENV:KAFKA_${k.replace(/[A-Z]/g, (c) => "_" + c).toUpperCase()}}")`);
+  }
+  // a secret written straight into the plan works, but it ends up in version control
+  const literal = (o, where) => Object.entries(o || {}).forEach(([k, v]) => {
+    if (SECRET_KEYS.has(k) && typeof v === "string" && !v.includes("${"))
+      console.error(`warning: ${where}.${k} is written in the plan; read it from the environment with "\${ENV:NAME}"`);
+  });
+  literal(sasl, "sasl");
+  if (typeof ssl === "object") literal(ssl, "ssl");
+}
+checkConnection();
+
+function kafkaConfig() {
+  const brokers = withEnv(conn.brokers, "brokers", false);
+  if (!Array.isArray(brokers) || !brokers.length) throw Error(`"brokers" must be a list like ["localhost:9092"]`);
+  const config = {
+    clientId: withEnv(conn.clientId || "kafka-event-gen", "clientId", false),
+    brokers: brokers.flatMap((b) => String(b).split(",")).map((b) => b.trim()).filter(Boolean), // one variable can hold "host1:9093,host2:9093"
+    logCreator: () => ({ namespace, label, log }) => {
+      const { message, timestamp, logger, stack, ...extra } = log;
+      const rest = Object.keys(extra).length ? " " + JSON.stringify(extra) : "";
+      console.error(redact(`kafkajs ${label} ${namespace}: ${message}${rest}`));
+    },
+  };
+  if (conn.ssl != null) {
+    config.ssl = typeof conn.ssl === "object" ? withEnv(conn.ssl, "ssl", true) : conn.ssl;
+    for (const k of ["ca", "cert", "key"])
+      for (const pem of [config.ssl[k]].flat().filter((x) => typeof x === "string"))
+        if (!pem.includes("-----BEGIN"))
+          throw Error(`ssl.${k}: expected PEM text (starting with -----BEGIN), not a file path; put the file's contents in an environment variable and use "\${ENV:NAME}"`);
+  }
+  if (conn.sasl != null) {
+    const sasl = withEnv(conn.sasl, "sasl", true);
+    sasl.mechanism = sasl.mechanism.toLowerCase();
+    if (sasl.mechanism === "oauthbearer") {
+      const value = sasl.token;
+      delete sasl.token;
+      sasl.oauthBearerProvider = async () => ({ value }); // kafkajs wants a function; the plan gives a token
+    }
+    config.sasl = sasl;
+  }
+  const how = [config.ssl && "TLS", config.sasl && `SASL ${config.sasl.mechanism}`].filter(Boolean).join(", ") || "plaintext";
+  console.error(`connecting to ${config.brokers.join(", ")} (${how}, from ${conn.from})`);
+  return config;
 }
 
 // ---- run ----
@@ -527,9 +852,8 @@ process.on("SIGINT", () => {
 (async () => {
   let producer;
   try {
-    if (!plan.dryRun) {
-      producer = new Kafka({ clientId: plan.clientId || "kafka-proto-gen", brokers: plan.brokers })
-        .producer({ createPartitioner: Partitioners.DefaultPartitioner });
+    if (!dryRun) {
+      producer = new Kafka(kafkaConfig()).producer({ createPartitioner: Partitioners.DefaultPartitioner });
       await producer.connect();
     }
     const rate = plan.ratePerSec || total;
@@ -539,7 +863,7 @@ process.on("SIGINT", () => {
       const n = Math.min(rate, total - sent);
       const batch = Array.from({ length: n }, (_, j) => makeMessage(sent + j));
 
-      if (plan.dryRun) {
+      if (dryRun) {
         batch.forEach((b) => console.log(JSON.stringify({
           topic: b.topic, key: b.msg.key, headers: b.msg.headers, value: b.shown,
         })));
@@ -554,12 +878,12 @@ process.on("SIGINT", () => {
       sent += n;
       console.error(`sent ${sent}/${total}`);
       const wait = 1000 - (Date.now() - t0);
-      if (!plan.dryRun && sent < total && !stopping && wait > 0) await new Promise((r) => setTimeout(r, wait));
+      if (!dryRun && sent < total && !stopping && wait > 0) await new Promise((r) => setTimeout(r, wait));
     }
   } catch (err) {
-    console.error(err.message || err);
+    console.error(redact(err.message || err));
     process.exitCode = 1;
   } finally {
-    if (producer) await producer.disconnect();
+    if (producer) await producer.disconnect().catch(() => {});
   }
 })();

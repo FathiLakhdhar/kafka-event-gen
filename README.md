@@ -1,4 +1,4 @@
-# kafka-proto-gen
+# kafka-event-gen
 
 Generates fake events from a JSON plan and publishes them to Kafka, or prints them for a dry run. Payloads can be binary Protobuf, Protobuf encoded as JSON, or schemaless JSON.
 
@@ -7,7 +7,8 @@ Generates fake events from a JSON plan and publishes them to Kafka, or prints th
 - Links related events through **pools**. For example, `OrderPaid` reuses the `orderId`, amount and `traceparent` of an earlier `OrderCreated`.
 - Picks event types by weight, or produces an exact count of each.
 - Sends at a fixed rate in batches grouped by topic, with Kafka keys and headers.
-- Checks the plan against the `.proto` files and payload definitions at startup, so typos fail before anything is sent.
+- Reads schemas from `.proto` source files or compiled descriptor sets (`.protobin`).
+- Checks the plan against the schemas and payload definitions at startup, so typos fail before anything is sent.
 
 ## Requirements
 
@@ -16,24 +17,43 @@ Generates fake events from a JSON plan and publishes them to Kafka, or prints th
 
 ## Install
 
+To run it from the clone:
+
 ```sh
 npm install
 ```
 
+To use it as a `kafka-event-gen` command from any folder, install it globally, either from your clone or straight from GitHub:
+
+```sh
+npm link                                                  # from the clone; follows your edits
+npm install -g github:FathiLakhdhar/kafka-event-gen       # from GitHub, without cloning
+```
+
+`npm uninstall -g kafka-event-gen` removes the command. The package is marked private, so it can't be published to npm by accident.
+
 ## Usage
 
 ```sh
-npm start                        # runs plans/plan.json
-node plan.js path/to/plan.json   # runs any plan
+kafka-event-gen path/to/plan.json                                         # runs a plan
+kafka-event-gen path/to/plan.json --dry-run                               # prints instead of sending
+kafka-event-gen path/to/plan.json --connection connections/staging.json   # sends to another cluster
+kafka-event-gen --help
 ```
 
-With `"dryRun": true`, each message is printed to stdout as one JSON line, after encoding and decoding it, so you see exactly what would go on the wire. Progress and dataset sizes go to stderr, which keeps the output clean:
+Without the global install, use `node plan.js` in place of `kafka-event-gen`. `npm start` runs `plans/plan.json`.
+
+`--connection` names a file with the Kafka connection settings, so the same plan runs against any cluster without editing it (see [Secured clusters](#secured-clusters)). Without it, the plan's own `brokers` are used. At startup the run prints where it connects, e.g. `connecting to b1:9093, b2:9093 (TLS, SASL scram-sha-512, from connections/staging.json)`.
+
+With `--dry-run` or `"dryRun": true`, each message is printed to stdout as one JSON line, after encoding and decoding it, so you see exactly what would go on the wire. Progress and dataset sizes go to stderr, which keeps the output clean:
 
 ```sh
 npm start > out.jsonl
 ```
 
 Press Ctrl+C once to stop after the current batch, or twice to force quit.
+
+Errors print as one line, like `Error: shop.OrderPaid rules: no field "ordrId" in shop.OrderPaid`, and the exit code is 1. Set `KAFKA_EVENT_GEN_DEBUG=1` to see the stack trace as well.
 
 ## Project layout
 
@@ -66,19 +86,67 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 
 | Key          | Description |
 |--------------|-------------|
-| `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]` |
-| `clientId`   | Kafka client id (default `kafka-proto-gen`) |
+| `brokers`    | Kafka bootstrap servers, e.g. `["localhost:9092"]`. Used when there's no `--connection` file |
+| `clientId`   | Kafka client id (default `kafka-event-gen`) |
+| `ssl`        | `true` for TLS with the system's CAs, or TLS options like `{ "ca": ..., "rejectUnauthorized": true }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
+| `sasl`       | SASL login, e.g. `{ "mechanism": "scram-sha-512", "username": ..., "password": ... }`. Usually in a `--connection` file (see [Secured clusters](#secured-clusters)) |
 | `count`      | Total number of messages to generate. Required with weights; optional with quotas, where it must equal the sum of event counts |
 | `ratePerSec` | Messages per one-second batch (default: all at once) |
-| `dryRun`     | `true` prints messages instead of sending them (no pause between batches) |
+| `dryRun`     | `true` prints messages instead of sending them (no pause between batches). `--dry-run` does the same without editing the plan |
 | `outDir`     | If set, also writes each encoded message to `NNNN-<Type>.protobin` |
 | `typeHeader` | If set, adds a header with this name holding the full message type |
+| `clock`      | Fixed "now" for every date, e.g. `"2026-01-01T00:00:00Z"`, so dates are the same on every run (see [Dates and times](#dates-and-times)) |
 | `datasets`   | Reference data built at startup (see [Datasets](#datasets)) |
 | `pools`      | Pools that events fill and read (see [Pools](#pools)) |
 | `defaults`   | Settings shared by every event (see below) |
 | `events`     | List of event definitions |
 
-Paths in `proto` and `outDir` are relative to the **plan file**, not the folder you run from.
+Paths in `proto`, `descriptor` and `outDir` are relative to the **plan file**, not the folder you run from.
+
+### Secured clusters
+
+Keep the connection out of the plan: put it in a connection file per cluster and pick one with `--connection`. A connection file holds only `brokers`, `clientId`, `ssl` and `sasl`, and reads credentials from the environment with `${ENV:NAME}`, so it holds no secrets either:
+
+```json
+{
+  "brokers": ["${ENV:KAFKA_BROKERS}"],
+  "ssl": true,
+  "sasl": { "mechanism": "scram-sha-512", "username": "${ENV:KAFKA_USER}", "password": "${ENV:KAFKA_PASSWORD}" }
+}
+```
+
+```sh
+export KAFKA_BROKERS=broker-1:9093,broker-2:9093 KAFKA_USER=generator KAFKA_PASSWORD=...
+node plan.js plans/plan.json --connection connections/staging.json
+```
+
+A connection file replaces all of the plan's `brokers`, `clientId`, `ssl` and `sasl`. They aren't merged, and a note says which plan settings are ignored. Without `--connection` the same four settings are read from the plan, which is handy for a local broker. Without `ssl` and `sasl` the connection is plaintext.
+
+`${ENV:NAME}` works in any string of `brokers`, `clientId`, `ssl` and `sasl`. A broker entry can hold a comma-separated list, as above.
+
+| `sasl.mechanism` | Needs |
+|------------------|-------|
+| `plain`, `scram-sha-256`, `scram-sha-512` | `username`, `password` |
+| `aws` | `authorizationIdentity`, `accessKeyId`, `secretAccessKey` (optional `sessionToken`) |
+| `oauthbearer` | `token`: a token that is sent as is. Refreshing it is up to you |
+
+`ssl` options are passed to Node's TLS connection. `ca`, `cert` and `key` take the PEM **text**, not a file path. Put the file's contents in a variable, e.g. `export KAFKA_CA="$(cat ca.pem)"` and `"ca": "${ENV:KAFKA_CA}"`. Use `"sasl"` without `"ssl"` for SASL_PLAINTEXT.
+
+Secrets stay out of the output:
+
+- the password, token, private keys and every value read from the environment for `ssl` or `sasl` show as `***` in errors and in the Kafka client's log lines, which go to stderr
+- a dry run (`--dry-run`) doesn't connect, so it doesn't read these variables and runs without them
+- a secret written straight into the plan still works, but prints a warning at startup
+
+The tool doesn't decrypt or store secrets. It only reads them from the environment of the run, so use whatever already holds them to fill that environment for one command:
+
+| Where the secret lives | How to run |
+|---|---|
+| Encrypted file in git ([SOPS](https://github.com/getsops/sops)) | `sops exec-env secrets/staging.enc.env 'node plan.js …'` |
+| 1Password | `op run --env-file=staging.env -- node plan.js …`, with `op://vault/item/field` references in `staging.env` |
+| HashiCorp Vault | `envconsul -secret=kafka/staging node plan.js …`, or export the values from `vault kv get` |
+| CI (GitHub Actions, GitLab…) | map the CI's secrets to `KAFKA_PASSWORD` and so on in the job's environment |
+| Your machine | `node --env-file=.env plan.js …` (built into Node). `.env` is in `.gitignore` so it can't be committed by accident |
 
 ### Events and defaults
 
@@ -87,7 +155,8 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | Key       | Description |
 |-----------|-------------|
 | `type`    | Fully qualified message type, e.g. `shop.OrderCreated` (required) |
-| `proto`   | `.proto` file containing the type (required, unless `payload` is set) |
+| `proto`   | `.proto` file containing the type (this, `descriptor` or `payload` is required) |
+| `descriptor` | Compiled `FileDescriptorSet` containing the type, in place of `proto` (see [Descriptor sets](#descriptor-sets)) |
 | `format`  | `"protobuf"` (default) or `"json"` (see [Payload formats](#payload-formats)) |
 | `payload` | Field path → rule, for a schemaless JSON event without a proto (see [Payload formats](#payload-formats)) |
 | `topic`   | Kafka topic (required) |
@@ -97,6 +166,24 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | `rules`   | Field path → rule, overriding the random value for that field |
 | `headers` | Header name → rule |
 | `pools`   | Pool name → record to add after each message (see [Pools](#pools)) |
+| `resend`  | Sends a stored message again, unchanged, in place of generating one (see [Duplicate messages](#duplicate-messages)) |
+
+### Descriptor sets
+
+If your schema is published as a compiled binary `FileDescriptorSet` rather than `.proto` sources, point `descriptor` at it wherever you would use `proto`:
+
+```json
+"defaults": { "descriptor": "schemas/my-api.protobin" },
+"events": [ { "type": "my.pkg.v1.ThingCreated", "topic": "things" } ]
+```
+
+Messages are generated, checked and encoded exactly as with the `.proto` the set was built from, and field paths are the same camelCase names. Build the set with `--include_imports` so that imported types such as `google.protobuf.Timestamp` are in it:
+
+```sh
+protoc -I protos --include_imports --descriptor_set_out=my-api.protobin protos/my/pkg/v1/*.proto
+```
+
+`proto` and `descriptor` can't both be set in `defaults`, or both on one event. An event's own `proto` or `descriptor` replaces whichever one `defaults` sets.
 
 ```json
 "defaults": {
@@ -169,13 +256,13 @@ Field paths use the camelCase names protobufjs generates (`order_id` → `orderI
 |------|---------|----------|
 | `static`      | `{ "static": "EUR" }` | That exact value |
 | `uuid`        | `{ "uuid": true }` | A random UUID |
-| `iso`         | `{ "iso": "recent" }` | A date: `"past"`, `"future"` or `"recent"`. Becomes a proper value for `google.protobuf.Timestamp` fields, otherwise an ISO string |
+| `iso`         | `{ "iso": "now+7d" }` | A date: `"past"`, `"future"`, `"recent"`, a time like `"now+7d"`, or a range `["now", "now+7d"]`, with an optional `precision` (see [Dates and times](#dates-and-times)). Becomes a proper value for `google.protobuf.Timestamp` fields, otherwise an ISO string |
 | `regex`       | `{ "regex": "EX[0-9]{4}" }` | A string matching the pattern |
 | `oneOf`       | `{ "oneOf": ["CARD", "PAYPAL"] }` | One of the listed values. Enum names work |
 | `int`         | `{ "int": [1, 5] }` | An integer between min and max, inclusive |
 | `email`       | `{ "email": true }` | A random email address |
 | `faker`       | `{ "faker": "person.fullName" }` | Any [Faker](https://fakerjs.dev/api/) function, with optional `"args": [...]` |
-| `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`) |
+| `traceparent` | `{ "traceparent": { "sampled": 0.9 } }` | A W3C `traceparent`. `sampled` is the chance of flag `01` (default `1`). Unsampled ones get flag `00`; for messages with no `traceparent` at all, see [Traced and untraced services](#traced-and-untraced-services) |
 | `field`       | `{ "field": "orderId" }` | A value from the record being built. **Headers, payloads and datasets only** |
 | `from`        | `{ "from": "contracts.currency" }` | A value from a dataset or pool (see [Reading](#reading-datasets-and-pools)) |
 | `ref`         | `{ "ref": "customers" }` | A whole record from a dataset or pool, as a link (same as `from` without a property) |
@@ -188,7 +275,67 @@ Any rule can also have:
 
 - **`"locale"`**: generates the value for a country, with local names, phone formats, cities and email domains. Use a fixed [Faker locale](https://fakerjs.dev/guide/localization.html) such as `"fr"`, `"de"`, `"es"` or `"en_GB"`, or a rule that produces one. For example, `{ "field": "country.locale" }` uses the locale of the record's own country.
 
+Header rules can also have:
+
+- **`"optional": true`**: leaves the header out of the message when the rule gives no value, instead of stopping the run. All other headers are unaffected. Use it for headers that are only sometimes present:
+
+  ```json
+  "headers": {
+    "x-sampled":   { "oneOf": [null, "1"], "optional": true },
+    "x-note":      { "field": "note", "optional": true },
+    "x-trace":     { "from": "order.trace", "optional": true }
+  }
+  ```
+
+  The second header follows a proto3 `optional` field, which is left out about 30% of the time. The third reads a header that an earlier event may have left out and stored with `$header.traceparent`. Without `optional`, a rule that gives no value is an error, so typos in a `field` path still fail loudly. `optional` doesn't make a pool or dataset read optional: an event still waits for a record to read. On a resend event, a left-out header keeps the copied value.
+
+### Traced and untraced services
+
+To mix messages from services that trace with messages from services that don't, define the event twice with weights, and remove the header from one copy with `null`:
+
+```json
+"defaults": { "headers": { "traceparent": { "traceparent": {} } } },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "weight": 30 },
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "weight": 70, "headers": { "traceparent": null } }
+]
+```
+
+About 30% of the messages carry a `traceparent` and the rest have none. With quotas, give each copy its own `count` (e.g. 300 and 700). If the event also adds to a pool, give both copies the same `pools`, store the header with `$header.traceparent`, and read it in linked events with `"optional": true`, so they leave it out too. This is different from `"sampled"`, which always sends the header and only changes its flag.
+
 `fromPool` still works as another name for `from`.
+
+### Dates and times
+
+An `iso` rule takes one of:
+
+| Value | Produces |
+|-------|----------|
+| `"past"`, `"future"`, `"recent"` | A random date in the last year, the next year, or the last day |
+| `"now"` | The current time |
+| `"today"` | Midnight UTC of the current day |
+| `"now+7d"`, `"today-1d"`, `"today-1d+9h-15m"` | `now` or `today` moved by one or more signed offsets in `s`, `m`, `h`, `d` or `w` (weeks) |
+| `["now", "now+7d"]` | A random time between two of the times above |
+
+```json
+"createdAt": { "iso": "now", "precision": "seconds" },
+"dueDate":   { "iso": "today+30d", "precision": "date" },
+"expiresAt": { "iso": ["now+1d", "now+7d"], "precision": "seconds" }
+```
+
+`precision` sets the format:
+
+| `precision` | Example |
+|-------------|---------|
+| `"millis"` (default) | `2026-10-28T14:03:22.208Z` |
+| `"seconds"` | `2026-10-28T14:03:22Z` |
+| `"date"` | `2026-10-28` |
+| `"epochMillis"` | `1793196202208` (a number) |
+| `"epochSeconds"` | `1793196202` (a number) |
+
+`seconds` and `date` round down, so a range starting at `now` can land a fraction of a second, or with `date` part of a day, before it. On a `google.protobuf.Timestamp` field, `seconds` and `date` set the stored value (no nanos, or midnight). The epoch formats don't apply to Timestamps, since they produce numbers. Use them for `int64` fields or headers.
+
+Without `clock`, "now" is the real time when each value is made, so it moves forward during a long run. With `clock`, "now" is that fixed instant for every message, so `now+7d` gives the same value on every run. Random dates (`past`, `future`, `recent`, ranges, and unset Timestamp fields) are also placed around the clock.
 
 ### Datasets
 
@@ -268,6 +415,7 @@ An event adds a record to a pool after each message it produces. Each record val
 - a field path, such as `orderId`
 - `$header.<name>`, the header value
 - `$from.<dataset or pool>`, the record this message read from that collection, stored as a link
+- `$message`, the whole message as sent (topic, key, headers and encoded value), for a [resend](#duplicate-messages)
 
 ```json
 { "type": "shop.OrderCreated",
@@ -378,6 +526,61 @@ Quotas are checked against datasets, pools and sub-pools at startup, so the run 
 Error: "order/toPay": shop.OrderPaid (600) take 600 records, but shop.OrderCreated (700) add 700, and only 560 of them go to "order/toPay"
 ```
 
+### Duplicate messages
+
+To test a consumer that deduplicates, send the same message more than once. A **resend** event sends a message that an earlier event stored, byte for byte. Use the simpler patterns below if only the id needs to match.
+
+**Exact copies: `resend`.** The original stores itself in a pool with `$message`, and a resend event sends it again:
+
+```json
+"pools": { "sent": {} },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "key": "orderId", "count": 3,
+    "headers": { "message-id": { "uuid": true } },
+    "pools": { "sent": { "message": "$message" } } },
+  { "resend": { "from": "sent.message", "take": true }, "count": 3 }
+]
+```
+
+Each copy has the same topic, key, headers and encoded value as its original, in every format and with every field type. Since a resend reads from a pool, the original is always sent first. With `"take": true` each stored message is resent once, and quotas check that there are enough. Without it, a random stored message is picked each time.
+
+A resend event doesn't use `defaults`, because a default topic or a new `traceparent` would change the copy. It can only have these keys:
+
+| Key | Description |
+|-----|-------------|
+| `resend` | `{ "from": "<pool>.<field>", "take": true }`: the record field that holds the message. `take` is optional |
+| `type` | A name for errors and logs. The copy keeps the original's type header |
+| `topic` | Sends the copy to another topic, for example a retry topic. Default: the original's topic |
+| `headers` | Headers to add or replace on the copy, e.g. `{ "x-retry": { "static": "1" } }` |
+| `pools` | Records to add after the copy: `$message`, `$header.<name>` or `$from.<pool>` |
+| `count`, `weight` | As for any event |
+
+To send each message three times, chain resends: the first copy stores itself again with `$message`, and a second resend takes from there:
+
+```json
+"pools": { "sent1": {}, "sent2": {} },
+"events": [
+  { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "count": 2,
+    "pools": { "sent1": { "message": "$message" } } },
+  { "resend": { "from": "sent1.message", "take": true }, "count": 2,
+    "pools": { "sent2": { "message": "$message" } } },
+  { "resend": { "from": "sent2.message", "take": true }, "count": 2 }
+]
+```
+
+Copies are mixed in with the other messages rather than sent right after their original.
+
+**Only the id matches.** When the consumer compares only an id header, the rest of each message can change:
+
+- **A fixed id:** one event with `"headers": { "message-id": { "static": "dup-test-0001" } }` and a `count`. The id is the same on every run, so a consumer that remembers ids will skip all of them on the next run, including the first. Change the id or clear the consumer's store between runs.
+- **A new id each run:** a dataset with one record, read by the header:
+
+  ```json
+  "datasets": { "dup": { "size": 1, "fields": { "id": { "uuid": true } } } },
+  "events": [ { "type": "shop.OrderPaid", "topic": "orders", "proto": "order.proto", "count": 3,
+    "headers": { "message-id": { "from": "dup.id" } } } ]
+  ```
+
 ## Example: plans/plan-datasets.json
 
 ```
@@ -402,7 +605,7 @@ Every payment carries its order's amount, currency, customer email and trace. Ev
 | `bool` | Random |
 | `bytes` | 8 random alphanumeric bytes |
 | enum | A random value, never `*_UNSPECIFIED` |
-| `google.protobuf.Timestamp` | A recent date |
+| `google.protobuf.Timestamp` | A recent date (relative to `clock` if set) |
 | nested message | Generated recursively, up to 4 levels deep |
 | `repeated` | 1–3 elements |
 | `map` | One entry, with a key of the right type |
@@ -413,11 +616,18 @@ Every payment carries its order's amount, currency, customer email and trace. Ev
 
 Before any message is generated or sent, the plan is checked and the run stops with a clear error if:
 
-- an event is missing `type`, `topic`, or a `proto` or `payload`, or the proto or type can't be loaded
-- an event has an unknown `format`, or combines `payload` with `proto`, `rules` or `"format": "protobuf"`
+- an event is missing `type`, `topic`, or a `proto`, `descriptor` or `payload`, or the proto, descriptor set or type can't be loaded (including a descriptor set built without `--include_imports`)
+- `defaults` or an event sets both `proto` and `descriptor`
+- an event has an unknown `format`, or combines `payload` with `proto`, `descriptor`, `rules` or `"format": "protobuf"`
 - a payload sets both an object and a field inside it (`customer` and `customer.name`)
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
+- an `iso` value isn't one of the forms in [Dates and times](#dates-and-times) (`"nwo"`, `"now+7y"`), a range ends before it starts, `precision` is unknown or used on a rule other than `iso`, an epoch `precision` is used on a Timestamp field, or `clock` isn't a date-time with a time zone
+- the command line has an unknown option or two plan files, or the `--connection` file is missing, isn't a JSON object, or has keys other than `brokers`, `clientId`, `ssl` and `sasl`
+- `ssl` isn't `true`, `false` or an object, `sasl.mechanism` is unknown, or a mechanism is missing a field it needs
+- a `${ENV:NAME}` variable isn't set or is empty (the error names the variable, never its value), or `ssl.ca`, `cert` or `key` is a file path instead of PEM text. These are checked when connecting, so a dry run skips them
+- `optional` isn't `true` or `false`, or is used on something other than a header's rule
+- a `traceparent` rule has an unknown option, or a `sampled` outside 0–1
 - `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
 - a rule path, `key` or pool record path doesn't exist in the message or payload
 - a `field` rule is used on a Protobuf message field
@@ -426,6 +636,7 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - a dataset reads a pool, datasets depend on each other in a loop, or a derived dataset wants more records than its source has
 - an event adds to a dataset, or a dataset and a pool share a name
 - a pool is read but no event adds to it
+- a `resend` reads a dataset, names no record field, or reads a field that no event fills with `$message`; or a resend event has keys it can't use, such as `rules`, `key` or `proto`
 - a `unique` rule runs out of values, or a dataset `take` runs out of records
 - quotas don't fit the datasets and pools (see [Weights or quotas](#weights-or-quotas))
 
