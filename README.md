@@ -17,18 +17,31 @@ Generates fake events from a JSON plan and publishes them to Kafka, or prints th
 
 ## Install
 
+To run it from the clone:
+
 ```sh
 npm install
 ```
 
+To use it as a `kafka-proto-gen` command from any folder, install it globally, either from your clone or straight from GitHub:
+
+```sh
+npm link                                                  # from the clone; follows your edits
+npm install -g github:FathiLakhdhar/kafka-proto-gen       # from GitHub, without cloning
+```
+
+`npm uninstall -g kafka-proto-gen` removes the command. The package is marked private, so it can't be published to npm by accident.
+
 ## Usage
 
 ```sh
-npm start                        # runs plans/plan.json
-node plan.js path/to/plan.json   # runs any plan
-node plan.js path/to/plan.json --dry-run                               # prints instead of sending
-node plan.js path/to/plan.json --connection connections/staging.json   # sends to another cluster
+kafka-proto-gen path/to/plan.json                                         # runs a plan
+kafka-proto-gen path/to/plan.json --dry-run                               # prints instead of sending
+kafka-proto-gen path/to/plan.json --connection connections/staging.json   # sends to another cluster
+kafka-proto-gen --help
 ```
+
+Without the global install, use `node plan.js` in place of `kafka-proto-gen`. `npm start` runs `plans/plan.json`.
 
 `--connection` names a file with the Kafka connection settings, so the same plan runs against any cluster without editing it (see [Secured clusters](#secured-clusters)). Without it, the plan's own `brokers` are used. At startup the run prints where it connects, e.g. `connecting to b1:9093, b2:9093 (TLS, SASL scram-sha-512, from connections/staging.json)`.
 
@@ -39,6 +52,8 @@ npm start > out.jsonl
 ```
 
 Press Ctrl+C once to stop after the current batch, or twice to force quit.
+
+Errors print as one line, like `Error: shop.OrderPaid rules: no field "ordrId" in shop.OrderPaid`, and the exit code is 1. Set `KAFKA_PROTO_GEN_DEBUG=1` to see the stack trace as well.
 
 ## Project layout
 

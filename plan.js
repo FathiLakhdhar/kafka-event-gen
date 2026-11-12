@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 const protobuf = require("protobufjs");
 const protobufDescriptor = require("protobufjs/ext/descriptor");
 const { faker, allFakers } = require("@faker-js/faker");
@@ -5,11 +6,37 @@ const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
 const path = require("path");
 
-// ---- command line: node plan.js [plan.json] [--connection <file>] [--dry-run] ----
-const USAGE = "usage: node plan.js [plan.json] [--connection <file>] [--dry-run]";
+// ---- command line: kafka-proto-gen <plan.json> [--connection <file>] [--dry-run] ----
+// errors before the run starts are shown as one line; set KAFKA_PROTO_GEN_DEBUG=1 for the stack trace
+process.on("uncaughtException", (err) => {
+  let text = process.env.KAFKA_PROTO_GEN_DEBUG ? err.stack : `Error: ${err.message}`;
+  try {
+    text = redact(text);
+  } catch {} // the error came before redaction was set up, so there's nothing to hide yet
+  console.error(text);
+  process.exit(1);
+});
+const USAGE = "usage: kafka-proto-gen <plan.json> [--connection <file>] [--dry-run]";
+const HELP = `${USAGE}
+
+Generates events from a plan and sends them to Kafka, or prints them.
+
+  <plan.json>          the plan to run
+  --connection <file>  Kafka connection settings (brokers, clientId, ssl, sasl); default: the plan's
+  --dry-run            print the messages as JSON lines instead of sending them
+  --help               show this help
+  --version            show the version`;
 const cli = { plan: null, connection: null, dryRun: false };
 for (let i = 2, args = process.argv; i < args.length; i++) {
   const a = args[i];
+  if (a === "--help" || a === "-h") {
+    console.log(HELP);
+    process.exit(0);
+  }
+  if (a === "--version" || a === "-v") {
+    console.log(require("./package.json").version);
+    process.exit(0);
+  }
   if (a === "--dry-run") cli.dryRun = true;
   else if (a === "--connection" || a.startsWith("--connection=")) {
     cli.connection = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
@@ -18,9 +45,19 @@ for (let i = 2, args = process.argv; i < args.length; i++) {
   else if (cli.plan) throw Error(`only one plan file, got ${cli.plan} and ${a}\n${USAGE}`);
   else cli.plan = a;
 }
-const planPath = path.resolve(cli.plan || "plans/plan.json");
+if (!cli.plan) {
+  console.error(`${USAGE}\n(--help for details)`);
+  process.exit(1);
+}
+const planPath = path.resolve(cli.plan);
 const planDir = path.dirname(planPath);
-const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
+const plan = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(planPath, "utf8"));
+  } catch (err) {
+    throw Error(`${cli.plan}: ${err.code === "ENOENT" ? "no such file" : err.message}`);
+  }
+})();
 const dryRun = cli.dryRun || !!plan.dryRun;
 
 // ---- merge defaults + events ----
