@@ -1,4 +1,5 @@
 const protobuf = require("protobufjs");
+const protobufDescriptor = require("protobufjs/ext/descriptor");
 const { faker, allFakers } = require("@faker-js/faker");
 const { Kafka, Partitioners } = require("kafkajs");
 const fs = require("fs");
@@ -11,15 +12,23 @@ const plan = JSON.parse(fs.readFileSync(planPath, "utf8"));
 // ---- merge defaults + events ----
 const clean = (o) => Object.fromEntries(Object.entries(o).filter(([, v]) => v !== null));
 const D = plan.defaults || {};
+// the schema comes from a .proto source file or a compiled FileDescriptorSet, never both
+const bothSchemas = (o) => o.proto != null && o.descriptor != null;
+if (bothSchemas(D)) throw Error(`defaults: use either "proto" or "descriptor", not both`);
 const events = plan.events.map((e) => {
+  if (bothSchemas(e)) throw Error(`${e.type}: use either "proto" or "descriptor", not both`);
   const m = { ...D, ...e, rules: clean({ ...D.rules, ...e.rules }), headers: clean({ ...D.headers, ...e.headers }) };
+  if (e.proto != null) delete m.descriptor; // the event's own schema replaces the other kind from defaults
+  if (e.descriptor != null) delete m.proto;
   if (e.payload) { // schemaless JSON event: the payload rules replace the proto schema
-    if (e.proto || e.rules) throw Error(`${e.type}: an event with "payload" can't also have "proto" or "rules"`);
+    if (e.proto || e.descriptor || e.rules)
+      throw Error(`${e.type}: an event with "payload" can't also have "proto", "descriptor" or "rules"`);
     if (m.format && m.format !== "json") throw Error(`${e.type}: an event with "payload" is always sent as JSON`);
     m.payload = clean({ ...D.payload, ...e.payload });
     m.format = "json";
     m.rules = {};
     delete m.proto;
+    delete m.descriptor;
   } else delete m.payload;
   m.format ??= "protobuf";
   if (m.pool) m.pools = { ...m.pools, [m.pool.name]: m.pool.add }; // old single-pool syntax
@@ -28,8 +37,8 @@ const events = plan.events.map((e) => {
   return m;
 });
 events.forEach((e) => {
-  if (!e.type || !e.topic || !(e.proto || e.payload))
-    throw Error(`event needs type, topic, and a proto or a payload: ${JSON.stringify(e.type)}`);
+  if (!e.type || !e.topic || !(e.proto || e.descriptor || e.payload))
+    throw Error(`event needs type, topic, and a proto, a descriptor or a payload: ${JSON.stringify(e.type)}`);
   if (!["protobuf", "json"].includes(e.format)) throw Error(`${e.type}: "format" must be "protobuf" or "json"`);
 });
 
@@ -49,14 +58,39 @@ if (!quotas && !(Number.isInteger(plan.count) && plan.count > 0))
   throw Error(`plan needs a positive "count" (or a "count" on every event)`);
 const left = new Map(events.map((e) => [e, e.count]));
 
-// ---- proto loading ----
+// ---- proto loading: .proto source files or binary FileDescriptorSets ----
 const roots = {};
 const types = {};
-const typeOf = (e) => (types[e.proto + "|" + e.type] ??= (() => {
-  const file = path.resolve(planDir, e.proto);
-  const root = (roots[file] ??= protobuf.loadSync(file).resolveAll());
-  return root.lookupType(e.type);
-})());
+function loadRoot(src, isDescriptor) {
+  const file = path.resolve(planDir, src);
+  return (roots[file] ??= (() => {
+    const what = isDescriptor ? "descriptor" : "proto";
+    if (isDescriptor && !fs.existsSync(file)) throw Error(`${what} "${src}": no file at ${file}`);
+    let set;
+    try {
+      if (isDescriptor) set = protobufDescriptor.FileDescriptorSet.decode(fs.readFileSync(file));
+    } catch (err) {
+      throw Error(`${what} "${src}": not a binary FileDescriptorSet (${err.message}); ` +
+        `build it with protoc --include_imports --descriptor_set_out=<file>`);
+    }
+    try {
+      return (isDescriptor ? protobuf.Root.fromDescriptor(set) : protobuf.loadSync(file)).resolveAll();
+    } catch (err) {
+      const hint = isDescriptor && /no such type/i.test(err.message)
+        ? " (build the descriptor set with protoc --include_imports so imported types are in it)" : "";
+      throw Error(`${what} "${src}": ${err.message}${hint}`);
+    }
+  })());
+}
+const typeOf = (e) => {
+  const src = e.descriptor ?? e.proto;
+  return (types[src + "|" + e.type] ??= (() => {
+    const t = loadRoot(src, e.descriptor != null).lookup(e.type);
+    if (!(t instanceof protobuf.Type))
+      throw Error(`${e.type}: no message type with this name in ${e.descriptor != null ? "descriptor" : "proto"} "${src}"`);
+    return t;
+  })());
+};
 
 // ---- helpers ----
 const get = (o, p) => p.split(".").reduce((a, k) => a?.[k], o);

@@ -7,7 +7,8 @@ Generates fake events from a JSON plan and publishes them to Kafka, or prints th
 - Links related events through **pools**. For example, `OrderPaid` reuses the `orderId`, amount and `traceparent` of an earlier `OrderCreated`.
 - Picks event types by weight, or produces an exact count of each.
 - Sends at a fixed rate in batches grouped by topic, with Kafka keys and headers.
-- Checks the plan against the `.proto` files and payload definitions at startup, so typos fail before anything is sent.
+- Reads schemas from `.proto` source files or compiled descriptor sets (`.protobin`).
+- Checks the plan against the schemas and payload definitions at startup, so typos fail before anything is sent.
 
 ## Requirements
 
@@ -78,7 +79,7 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 | `defaults`   | Settings shared by every event (see below) |
 | `events`     | List of event definitions |
 
-Paths in `proto` and `outDir` are relative to the **plan file**, not the folder you run from.
+Paths in `proto`, `descriptor` and `outDir` are relative to the **plan file**, not the folder you run from.
 
 ### Events and defaults
 
@@ -87,7 +88,8 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | Key       | Description |
 |-----------|-------------|
 | `type`    | Fully qualified message type, e.g. `shop.OrderCreated` (required) |
-| `proto`   | `.proto` file containing the type (required, unless `payload` is set) |
+| `proto`   | `.proto` file containing the type (this, `descriptor` or `payload` is required) |
+| `descriptor` | Compiled `FileDescriptorSet` containing the type, in place of `proto` (see [Descriptor sets](#descriptor-sets)) |
 | `format`  | `"protobuf"` (default) or `"json"` (see [Payload formats](#payload-formats)) |
 | `payload` | Field path → rule, for a schemaless JSON event without a proto (see [Payload formats](#payload-formats)) |
 | `topic`   | Kafka topic (required) |
@@ -97,6 +99,23 @@ Each event is merged on top of `defaults`. `rules` and `headers` are merged key 
 | `rules`   | Field path → rule, overriding the random value for that field |
 | `headers` | Header name → rule |
 | `pools`   | Pool name → record to add after each message (see [Pools](#pools)) |
+
+### Descriptor sets
+
+If your schema is published as a compiled binary `FileDescriptorSet` rather than `.proto` sources, point `descriptor` at it wherever you would use `proto`:
+
+```json
+"defaults": { "descriptor": "schemas/my-api.protobin" },
+"events": [ { "type": "my.pkg.v1.ThingCreated", "topic": "things" } ]
+```
+
+Messages are generated, checked and encoded exactly as with the `.proto` the set was built from, and field paths are the same camelCase names. Build the set with `--include_imports` so that imported types such as `google.protobuf.Timestamp` are in it:
+
+```sh
+protoc -I protos --include_imports --descriptor_set_out=my-api.protobin protos/my/pkg/v1/*.proto
+```
+
+`proto` and `descriptor` can't both be set in `defaults`, or both on one event. An event's own `proto` or `descriptor` replaces whichever one `defaults` sets.
 
 ```json
 "defaults": {
@@ -413,8 +432,9 @@ Every payment carries its order's amount, currency, customer email and trace. Ev
 
 Before any message is generated or sent, the plan is checked and the run stops with a clear error if:
 
-- an event is missing `type`, `topic`, or a `proto` or `payload`, or the proto or type can't be loaded
-- an event has an unknown `format`, or combines `payload` with `proto`, `rules` or `"format": "protobuf"`
+- an event is missing `type`, `topic`, or a `proto`, `descriptor` or `payload`, or the proto, descriptor set or type can't be loaded (including a descriptor set built without `--include_imports`)
+- `defaults` or an event sets both `proto` and `descriptor`
+- an event has an unknown `format`, or combines `payload` with `proto`, `descriptor`, `rules` or `"format": "protobuf"`
 - a payload sets both an object and a field inside it (`customer` and `customer.name`)
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
