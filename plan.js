@@ -581,8 +581,8 @@ function makeMessage(i) {
   const headers = {};
   if (plan.typeHeader) headers[plan.typeHeader] = e.type;
   for (const [h, r] of Object.entries(e.headers)) {
-    const v = byRule(r, obj);
-    if (v == null) throw Error(`${e.type} header ${h}: rule produced no value`);
+    const v = byRuleIn(`${e.type} headers.${h}`, r, obj); // applies "unique" like other rules
+    if (v == null) throw Error(`${e.type} headers.${h}: rule produced no value`);
     headers[h] = String(v);
   }
 
