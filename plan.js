@@ -96,9 +96,13 @@ const typeOf = (e) => {
 const get = (o, p) => p.split(".").reduce((a, k) => a?.[k], o);
 const hex = (n) => faker.string.hexadecimal({ length: n, casing: "lower", prefix: "" });
 const isTs = (t) => t && t.fullName === ".google.protobuf.Timestamp";
+// a date, ISO string or epoch millis; a value already in Timestamp form (e.g. read from a pool) is kept
 const toTs = (d) => {
+  if (d && typeof d === "object" && !(d instanceof Date) && "seconds" in d) return { seconds: d.seconds, nanos: d.nanos ?? 0 };
   const ms = new Date(d).getTime();
-  return { seconds: Math.floor(ms / 1000), nanos: (ms % 1000) * 1e6 };
+  if (Number.isNaN(ms)) throw Error(`${JSON.stringify(d)} isn't a date, so it can't be a google.protobuf.Timestamp`);
+  const seconds = Math.floor(ms / 1000);
+  return { seconds, nanos: (ms - seconds * 1000) * 1e6 };
 };
 const fakerFn = (p, fk = faker) => {
   const i = p.lastIndexOf(".");
@@ -487,8 +491,13 @@ if (quotas) {
 function value(f, rules, depth, p) {
   const t = f.resolvedType;
   if (rules[p]) {
-    const v = byRuleIn(`${f.parent.fullName.slice(1)}.${f.name}`, rules[p]);
-    return isTs(t) ? toTs(v) : v;
+    const scope = `${f.parent.fullName.slice(1)}.${f.name}`;
+    const v = byRuleIn(scope, rules[p]);
+    try {
+      return isTs(t) ? toTs(v) : v;
+    } catch (err) {
+      throw Error(`${scope}: ${err.message}`);
+    }
   }
   if (isTs(t)) return toTs(faker.date.recent());
   if (t instanceof protobuf.Enum) {
