@@ -74,6 +74,7 @@ Both can be **split** into sub-pools that don't overlap, for example `customers/
 | `dryRun`     | `true` prints messages instead of sending them (no pause between batches) |
 | `outDir`     | If set, also writes each encoded message to `NNNN-<Type>.protobin` |
 | `typeHeader` | If set, adds a header with this name holding the full message type |
+| `clock`      | Fixed "now" for every date, e.g. `"2026-01-01T00:00:00Z"`, so dates are the same on every run (see [Dates and times](#dates-and-times)) |
 | `datasets`   | Reference data built at startup (see [Datasets](#datasets)) |
 | `pools`      | Pools that events fill and read (see [Pools](#pools)) |
 | `defaults`   | Settings shared by every event (see below) |
@@ -188,7 +189,7 @@ Field paths use the camelCase names protobufjs generates (`order_id` → `orderI
 |------|---------|----------|
 | `static`      | `{ "static": "EUR" }` | That exact value |
 | `uuid`        | `{ "uuid": true }` | A random UUID |
-| `iso`         | `{ "iso": "recent" }` | A date: `"past"`, `"future"` or `"recent"`. Becomes a proper value for `google.protobuf.Timestamp` fields, otherwise an ISO string |
+| `iso`         | `{ "iso": "now+7d" }` | A date: `"past"`, `"future"`, `"recent"`, a time like `"now+7d"`, or a range `["now", "now+7d"]`, with an optional `precision` (see [Dates and times](#dates-and-times)). Becomes a proper value for `google.protobuf.Timestamp` fields, otherwise an ISO string |
 | `regex`       | `{ "regex": "EX[0-9]{4}" }` | A string matching the pattern |
 | `oneOf`       | `{ "oneOf": ["CARD", "PAYPAL"] }` | One of the listed values. Enum names work |
 | `int`         | `{ "int": [1, 5] }` | An integer between min and max, inclusive |
@@ -208,6 +209,38 @@ Any rule can also have:
 - **`"locale"`**: generates the value for a country, with local names, phone formats, cities and email domains. Use a fixed [Faker locale](https://fakerjs.dev/guide/localization.html) such as `"fr"`, `"de"`, `"es"` or `"en_GB"`, or a rule that produces one. For example, `{ "field": "country.locale" }` uses the locale of the record's own country.
 
 `fromPool` still works as another name for `from`.
+
+### Dates and times
+
+An `iso` rule takes one of:
+
+| Value | Produces |
+|-------|----------|
+| `"past"`, `"future"`, `"recent"` | A random date in the last year, the next year, or the last day |
+| `"now"` | The current time |
+| `"today"` | Midnight UTC of the current day |
+| `"now+7d"`, `"today-1d"`, `"today-1d+9h-15m"` | `now` or `today` moved by one or more signed offsets in `s`, `m`, `h`, `d` or `w` (weeks) |
+| `["now", "now+7d"]` | A random time between two of the times above |
+
+```json
+"createdAt": { "iso": "now", "precision": "seconds" },
+"dueDate":   { "iso": "today+30d", "precision": "date" },
+"expiresAt": { "iso": ["now+1d", "now+7d"], "precision": "seconds" }
+```
+
+`precision` sets the format:
+
+| `precision` | Example |
+|-------------|---------|
+| `"millis"` (default) | `2026-10-28T14:03:22.208Z` |
+| `"seconds"` | `2026-10-28T14:03:22Z` |
+| `"date"` | `2026-10-28` |
+| `"epochMillis"` | `1793196202208` (a number) |
+| `"epochSeconds"` | `1793196202` (a number) |
+
+`seconds` and `date` round down, so a range starting at `now` can land a fraction of a second, or with `date` part of a day, before it. On a `google.protobuf.Timestamp` field, `seconds` and `date` set the stored value (no nanos, or midnight). The epoch formats don't apply to Timestamps, since they produce numbers. Use them for `int64` fields or headers.
+
+Without `clock`, "now" is the real time when each value is made, so it moves forward during a long run. With `clock`, "now" is that fixed instant for every message, so `now+7d` gives the same value on every run. Random dates (`past`, `future`, `recent`, ranges, and unset Timestamp fields) are also placed around the clock.
 
 ### Datasets
 
@@ -421,7 +454,7 @@ Every payment carries its order's amount, currency, customer email and trace. Ev
 | `bool` | Random |
 | `bytes` | 8 random alphanumeric bytes |
 | enum | A random value, never `*_UNSPECIFIED` |
-| `google.protobuf.Timestamp` | A recent date |
+| `google.protobuf.Timestamp` | A recent date (relative to `clock` if set) |
 | nested message | Generated recursively, up to 4 levels deep |
 | `repeated` | 1–3 elements |
 | `map` | One entry, with a key of the right type |
@@ -438,6 +471,7 @@ Before any message is generated or sent, the plan is checked and the run stops w
 - a payload sets both an object and a field inside it (`customer` and `customer.name`)
 - the plan has no top-level `count` with weights, mixes `weight` and `count` on an event, or leaves `count` off some events with quotas
 - a rule uses an unknown rule type (`{ "rgex": "..." }`), a Faker function that doesn't exist, or an unknown locale
+- an `iso` value isn't one of the forms in [Dates and times](#dates-and-times) (`"nwo"`, `"now+7y"`), a range ends before it starts, `precision` is unknown or used on a rule other than `iso`, an epoch `precision` is used on a Timestamp field, or `clock` isn't a date-time with a time zone
 - `locale` is used on a rule other than `faker` or `email`, or `records` isn't a list of objects
 - a rule path, `key` or pool record path doesn't exist in the message or payload
 - a `field` rule is used on a Protobuf message field

@@ -107,6 +107,59 @@ const fakerFn = (p, fk = faker) => {
   return typeof fn === "function" ? fn.bind(mod) : null;
 };
 
+// ---- time ----
+// "now" is the plan's fixed "clock" if it has one, otherwise the real time when each value is made
+let clockMs = null;
+if (plan.clock != null) {
+  const ok = typeof plan.clock === "string" && /^\d{4}-\d{2}-\d{2}T.*(Z|[+-]\d{2}:\d{2})$/.test(plan.clock);
+  clockMs = ok ? Date.parse(plan.clock) : NaN;
+  if (Number.isNaN(clockMs))
+    throw Error(`"clock" must be an ISO date-time with a time zone, like "2026-01-01T00:00:00Z"; got ${JSON.stringify(plan.clock)}`);
+  for (const f of [faker, ...Object.values(allFakers)]) f.setDefaultRefDate(new Date(clockMs)); // past, future, recent
+}
+const nowMs = () => clockMs ?? Date.now();
+const UNIT = { s: 1e3, m: 6e4, h: 36e5, d: 864e5, w: 6048e5 };
+const TIME = /^(now|today)((?:[+-]\d+[smhdw])*)$/;
+const isTime = (t) => typeof t === "string" && TIME.test(t);
+// "now" or "today" (midnight UTC), plus any number of signed offsets: "now+7d", "today-1d+9h"
+function timeOf(token) {
+  const [, base, offsets] = token.match(TIME);
+  let t = nowMs();
+  if (base === "today") t = Math.floor(t / UNIT.d) * UNIT.d;
+  for (const [, sign, n, u] of offsets.matchAll(/([+-])(\d+)([smhdw])/g)) t += (sign === "-" ? -1 : 1) * n * UNIT[u];
+  return t;
+}
+const PRECISIONS = ["millis", "seconds", "date", "epochMillis", "epochSeconds"];
+function isoValue(r) {
+  let ms;
+  if (Array.isArray(r.iso)) {
+    const [from, to] = r.iso.map(timeOf);
+    if (from > to) throw Error(`iso range ${JSON.stringify(r.iso)} ends before it starts`);
+    ms = faker.date.between({ from, to }).getTime();
+  } else if (["past", "future", "recent"].includes(r.iso)) ms = faker.date[r.iso]().getTime();
+  else ms = timeOf(r.iso);
+  const secs = Math.floor(ms / 1000);
+  switch (r.precision ?? "millis") {
+    case "seconds": return new Date(secs * 1000).toISOString().replace(".000Z", "Z");
+    case "date": return new Date(ms).toISOString().slice(0, 10);
+    case "epochMillis": return ms;
+    case "epochSeconds": return secs;
+    default: return new Date(ms).toISOString();
+  }
+}
+function checkIso(r, where) {
+  const v = r.iso;
+  if (Array.isArray(v)) {
+    if (v.length !== 2 || !v.every(isTime))
+      throw Error(`${where}: an iso range needs two times like ["now", "now+7d"], got ${JSON.stringify(v)}`);
+    if (timeOf(v[0]) > timeOf(v[1])) throw Error(`${where}: iso range ${JSON.stringify(v)} ends before it starts`);
+  } else if (!["past", "future", "recent"].includes(v) && !isTime(v))
+    throw Error(`${where}: unknown iso value ${JSON.stringify(v)} (expected "past", "future", "recent", ` +
+      `"now" or "today" with optional offsets like "now+7d" or "today-1d+9h", or a range like ["now", "now+7d"])`);
+  if (r.precision != null && !PRECISIONS.includes(r.precision))
+    throw Error(`${where}: "precision" must be one of ${PRECISIONS.join(", ")}, got ${JSON.stringify(r.precision)}`);
+}
+
 // ---- collections: datasets (filled at startup) and pools (filled by events) ----
 // a collection holds records in sub-pools; without "split" it has one unnamed sub-pool ""
 const DS = plan.datasets || {};
@@ -189,8 +242,7 @@ const mapKey = (t) => (t === "string" ? faker.word.noun() : String(scalar(t)));
 function byRule(r, obj) {
   if ("static" in r) return r.static;
   if (r.uuid) return faker.string.uuid();
-  if (r.iso) return (r.iso === "past" ? faker.date.past()
-    : r.iso === "future" ? faker.date.future() : faker.date.recent()).toISOString();
+  if ("iso" in r) return isoValue(r);
   if (r.regex) return faker.helpers.fromRegExp(r.regex);
   if (r.oneOf) return faker.helpers.arrayElement(r.oneOf);
   if (r.int) return faker.number.int({ min: r.int[0], max: r.int[1] });
@@ -257,6 +309,8 @@ function checkRule(r, where, reads, inDataset = false) {
   if (!r || typeof r !== "object") throw Error(`${where}: rule must be an object, got ${JSON.stringify(r)}`);
   const kind = RULES.find((k) => k in r);
   if (!kind) throw Error(`${where}: unknown rule ${JSON.stringify(r)} (expected one of ${RULES.join(", ")})`);
+  if (kind === "iso") checkIso(r, where);
+  else if (r.precision != null) throw Error(`${where}: "precision" only works with iso rules`);
   if (kind === "faker" && !fakerFn(r.faker)) throw Error(`${where}: faker has no function "${r.faker}"`);
   if (r.locale != null) {
     if (kind !== "faker" && kind !== "email") throw Error(`${where}: "locale" only works with faker and email rules`);
@@ -278,6 +332,7 @@ function checkPath(type, p, where) {
     if (!f) throw Error(`${where}: no field "${p}" in ${type.fullName.slice(1)}`);
     t = f.resolvedType;
   }
+  return t;
 }
 
 // ---- datasets: check, order by dependency, build ----
@@ -366,7 +421,9 @@ events.forEach((e) => {
     const Type = typeOf(e);
     checkField = (p, where) => checkPath(Type, p, where);
     for (const [p, r] of Object.entries(e.rules)) {
-      checkPath(Type, p, `${e.type} rules`);
+      const t = checkPath(Type, p, `${e.type} rules`);
+      if (isTs(t) && /^epoch/.test(r?.precision))
+        throw Error(`${e.type} rules.${p}: "precision": "${r.precision}" makes a number, which doesn't fit a google.protobuf.Timestamp`);
       if (checkRule(r, `${e.type} rules.${p}`, reads) === "field")
         throw Error(`${e.type} rules.${p}: "field" rules only work in headers, payloads and datasets`);
     }
